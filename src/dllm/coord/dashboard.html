@@ -54,6 +54,36 @@
               padding-top: 1rem; border-top: 1px solid var(--border); }
     code { font-family: ui-monospace, Menlo, monospace; font-size: .85em;
            background: var(--bg); padding: .1rem .3rem; border-radius: 3px; }
+    /* round-progress bar */
+    .progress-card { margin-top: 1rem; }
+    .progress-head { display: flex; justify-content: space-between; align-items: baseline;
+                     flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
+    .progress-head .title { font-weight: 600; font-size: 1rem; }
+    .progress-head .eta { color: var(--muted); font-size: .9rem;
+                          font-variant-numeric: tabular-nums; }
+    .progress-track { position: relative; height: 14px; background: var(--bg);
+                      border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+    .progress-fill { height: 100%; width: 0; background: var(--accent);
+                     transition: width .5s ease, background-color .3s; border-radius: 7px 0 0 7px; }
+    .progress-fill.full { border-radius: 7px; }
+    .progress-fill.landing { background: var(--good); }
+    .progress-fill.late { background: var(--warn); }
+    .progress-fill.overdue { background: #dc2626; }
+    .progress-marker { position: absolute; top: -2px; height: 18px; width: 1px;
+                       background: var(--muted); }
+    .progress-marker::after { content: attr(data-label); position: absolute; top: 20px; left: -1.5rem;
+                              font-size: .7rem; color: var(--muted); white-space: nowrap; }
+    .progress-foot { display: flex; justify-content: space-between; color: var(--muted);
+                     font-size: .8rem; margin-top: .35rem;
+                     font-variant-numeric: tabular-nums; }
+    .progress-indeterminate .progress-fill {
+      width: 30% !important; background: var(--border);
+      animation: indet 1.6s infinite ease-in-out;
+    }
+    @keyframes indet {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(333%); }
+    }
   </style>
 </head>
 <body>
@@ -102,6 +132,21 @@
     <div class="card"><div class="label">est. electricity cost</div>
       <div class="value" id="cost">—</div>
       <div class="sub" id="cost_sub">@ €0.30 / kWh (EU avg, configurable)</div></div>
+  </div>
+
+  <div class="card progress-card" id="progressCard">
+    <div class="progress-head">
+      <span class="title" id="progressTitle">round —</span>
+      <span class="eta" id="progressEta">—</span>
+    </div>
+    <div class="progress-track" id="progressTrack">
+      <div class="progress-fill" id="progressFill"></div>
+      <div class="progress-marker" id="progressMarker" style="display:none" data-label=""></div>
+    </div>
+    <div class="progress-foot">
+      <span id="progressFootLeft">—</span>
+      <span id="progressFootRight">—</span>
+    </div>
   </div>
 
   <h2>training metric over rounds</h2>
@@ -389,6 +434,82 @@ function drawChart(history) {
 }
 
 // ---------------------------------------------------------------------------
+// Round progress bar
+// ---------------------------------------------------------------------------
+function updateRoundProgress(status, m) {
+  const card = document.getElementById("progressCard");
+  const titleEl = document.getElementById("progressTitle");
+  const etaEl = document.getElementById("progressEta");
+  const fill = document.getElementById("progressFill");
+  const marker = document.getElementById("progressMarker");
+  const footL = document.getElementById("progressFootLeft");
+  const footR = document.getElementById("progressFootRight");
+
+  const open = status.round_open_seconds || 0;
+  const avg = m.avg_round_seconds || 0;
+  const timeout = status.round_timeout_seconds || 0;
+
+  titleEl.textContent = `round ${status.current_round}`;
+
+  // Reset modifier classes between refreshes
+  fill.classList.remove("landing", "late", "overdue", "full");
+  card.classList.remove("progress-indeterminate");
+
+  if (avg <= 0) {
+    // No rolling average yet (first 1–2 rounds). Show indeterminate animation.
+    card.classList.add("progress-indeterminate");
+    etaEl.textContent = `open ${fmtClock(open)}`;
+    footL.textContent = "need ≥2 completed rounds for ETA";
+    footR.textContent = timeout > 0 ? `timeout ${fmtClock(timeout)}` : "";
+    // Hide timeout marker when nothing to anchor it against
+    marker.style.display = "none";
+    return;
+  }
+
+  // Use the larger of (avg, open) as the bar's reference span so we never
+  // shrink the track when a round runs long — overdue shows as 100% with
+  // a red fill rather than the bar jumping back.
+  const span = Math.max(avg, open, 1);
+  const eta = avg - open;  // negative when overdue
+  const pct = Math.min(100, (open / span) * 100);
+
+  // Color states: tied to the elapsed-vs-avg ratio
+  const ratio = open / avg;
+  if (ratio >= 1.0) {
+    fill.classList.add("overdue");
+    fill.classList.add("full");
+  } else if (ratio >= 0.9) {
+    fill.classList.add("landing");
+  } else if (ratio >= 0.75 && timeout > 0 && open > 0.75 * timeout) {
+    // close to the timeout — flag visually even if avg isn't exceeded yet
+    fill.classList.add("late");
+  }
+  fill.style.width = pct + "%";
+
+  if (eta >= 0) {
+    etaEl.textContent = `open ${fmtClock(open)} · ETA ~${fmtClock(eta)}`;
+  } else {
+    etaEl.textContent = `open ${fmtClock(open)} · ${fmtClock(-eta)} past avg ETA`;
+  }
+  footL.textContent = `avg last 10 rounds: ${fmtClock(avg)}`;
+  if (timeout > 0) {
+    footR.textContent = `timeout at ${fmtClock(timeout)}`;
+    // Position marker proportionally on the bar (only show if within view)
+    if (timeout <= span) {
+      const markerPct = (timeout / span) * 100;
+      marker.style.display = "";
+      marker.style.left = markerPct + "%";
+      marker.dataset.label = "timeout";
+    } else {
+      marker.style.display = "none";
+    }
+  } else {
+    footR.textContent = "";
+    marker.style.display = "none";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Poll loop
 // ---------------------------------------------------------------------------
 let lastRound = -1, lastBumpAt = Date.now();
@@ -503,6 +624,15 @@ async function refresh() {
     document.getElementById("cost").textContent = fmtMoney(eur);
     document.getElementById("cost_sub").textContent = `@ €${COST_PER_KWH_EUR.toFixed(2)} / kWh (EU avg, configurable)`;
 
+    // ---------- round progress + ETA ----------
+    // Cache the status/metrics + anchor wall-clock for the 1Hz tween,
+    // then drive an initial draw. The tween updates the bar in between polls.
+    window._roundProgressAnchor = {
+      status, m, wallAnchor: Date.now(),
+      serverOpenAtAnchor: status.round_open_seconds || 0,
+    };
+    updateRoundProgress(status, m);
+
     drawChart(hist);
 
     // recent rounds table
@@ -528,6 +658,19 @@ async function refresh() {
 buildTabs();
 refresh();
 setInterval(refresh, 5000);
+
+// 1Hz local tween: re-runs the progress bar with an interpolated
+// round_open_seconds so the bar advances smoothly between 5s polls.
+setInterval(() => {
+  const a = window._roundProgressAnchor;
+  if (!a) return;
+  const drift = (Date.now() - a.wallAnchor) / 1000;
+  const interpolated = {
+    ...a.status,
+    round_open_seconds: a.serverOpenAtAnchor + drift,
+  };
+  updateRoundProgress(interpolated, a.m);
+}, 1000);
 </script>
 </body>
 </html>
