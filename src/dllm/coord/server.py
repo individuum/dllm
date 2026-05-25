@@ -22,7 +22,12 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-_DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+_DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
+
+
+def _load_dashboard_html() -> str:
+    """Re-read on every request — UI tweaks no longer require a coord restart."""
+    return _DASHBOARD_PATH.read_text(encoding="utf-8")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -415,7 +420,7 @@ def create_app(state: CoordinatorState) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> HTMLResponse:
-        return HTMLResponse(_DASHBOARD_HTML)
+        return HTMLResponse(_load_dashboard_html())
 
     @app.get("/health")
     def health() -> dict:

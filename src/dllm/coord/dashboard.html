@@ -60,9 +60,9 @@
     <div class="card"><div class="label">cumulative FLOPs</div>
       <div class="value" id="flops">—</div>
       <div class="sub" id="flops_sub">— of 10²⁵ systemic-risk line</div></div>
-    <div class="card"><div class="label">workers</div>
+    <div class="card"><div class="label">active workers</div>
       <div class="value" id="workers">—</div>
-      <div class="sub" id="workers_sub">— registered</div></div>
+      <div class="sub" id="workers_sub">— this round</div></div>
   </div>
 
   <h2>val loss over rounds</h2>
@@ -159,8 +159,14 @@ async function refresh() {
     document.getElementById("flops").textContent = fmtFlops(status.flops_total);
     document.getElementById("flops_sub").textContent =
       ((status.flops_total / 1e25) * 100).toFixed(4) + "% of 10²⁵ systemic-risk line";
-    document.getElementById("workers").textContent = `${status.n_submitted} / ${status.world_size_target ?? (status.n_submitted + status.waiting_for)}`;
-    document.getElementById("workers_sub").textContent = `${status.n_registered} registered · waiting for ${status.waiting_for}`;
+    document.getElementById("workers").textContent = status.n_registered;
+    const ws_target = status.n_submitted + status.waiting_for;
+    const phase = status.n_submitted >= ws_target
+      ? "delta in, advancing"
+      : status.n_submitted > 0
+        ? `${status.n_submitted}/${ws_target} delta(s) in, waiting for ${status.waiting_for}`
+        : `computing inner loop · ${ws_target} delta(s) needed`;
+    document.getElementById("workers_sub").textContent = phase;
     document.getElementById("open").textContent =
       `${fmtSeconds(status.round_open_seconds)} / timeout ${fmtSeconds(status.round_timeout_seconds)}`;
     document.getElementById("quorum").textContent =
