@@ -142,6 +142,40 @@ class _nullcontext:
         return False
 
 
+def compute_inner_steps_for_target(
+    tok_per_s: float,
+    target_seconds: float,
+    batch: int,
+    seq: int,
+    min_steps: int = 50,
+    max_steps: int = 2000,
+) -> int:
+    """Choose `inner_steps` so one inner loop runs for ~`target_seconds` wall clock.
+
+    Heterogeneous-fleet sizing per PLAN §3: each worker hits the same per-round
+    wall clock regardless of GPU speed, so no one idles waiting for the slow
+    node. (Anchor pods on H100s and individuals on consumer GPUs land on the
+    same outer-step cadence.)
+
+    Bounds reflect DiLoCo paper guidance: <50 steps gives too little local work
+    to amortize the sync cost; >2000 risks worker drift exceeding what the
+    outer optimizer can pull back.
+    """
+    if tok_per_s <= 0:
+        return min_steps
+    target_tokens = tok_per_s * target_seconds
+    steps = int(target_tokens / max(1, batch * seq))
+    return max(min_steps, min(max_steps, steps))
+
+
+def _sync_device(device: torch.device) -> None:
+    """Wait for in-flight kernels on the given device before timing."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 class Worker:
     def __init__(
         self,
@@ -153,6 +187,8 @@ class Worker:
         val_data: Path | None,
         bf16: bool,
         val_batches: int = 8,
+        auto_tune_steps: bool = False,
+        target_round_seconds: float = 90.0,
     ) -> None:
         self.coord_url = coord_url.rstrip("/")
         self.preset = preset
@@ -165,6 +201,8 @@ class Worker:
         # an error and the user can rerun with --no-bf16.
         self.bf16 = bf16 and device.type in ("cuda", "mps")
         self.val_batches = val_batches
+        self.auto_tune_steps = auto_tune_steps
+        self.target_round_seconds = target_round_seconds
 
         # Ed25519 identity — persisted in .dllm/identity.key
         self.sk = load_or_create_identity()
@@ -359,6 +397,57 @@ class Worker:
 
         return compute_delta(snap, self.model)
 
+    def _benchmark_throughput(
+        self, warmup_steps: int = 5, measure_steps: int = 30
+    ) -> float:
+        """Warmup + timed inner-loop probe. Returns measured tokens/sec on this device.
+
+        Runs real forward+backward+step on the actual model/data; the optimizer
+        state is left warmed up (not reset), so this counts as a small head-start
+        on the first round rather than wasted compute.
+        """
+        assert self.opt is not None and self.train_loader is not None
+        log.info(
+            "[AUTO-TUNE] benchmarking throughput: %d warmup + %d measured steps...",
+            warmup_steps,
+            measure_steps,
+        )
+        self.model.train()
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            if self.bf16
+            else _nullcontext()
+        )
+
+        for _ in range(warmup_steps):
+            x, y = self.train_loader.next_batch()
+            with autocast_ctx:
+                _, loss = self.model(x, y)
+            loss.backward()
+            self.opt.step()
+            self.opt.zero_grad(set_to_none=True)
+        _sync_device(self.device)
+
+        t0 = time.time()
+        for _ in range(measure_steps):
+            x, y = self.train_loader.next_batch()
+            with autocast_ctx:
+                _, loss = self.model(x, y)
+            loss.backward()
+            self.opt.step()
+            self.opt.zero_grad(set_to_none=True)
+        _sync_device(self.device)
+        dt = time.time() - t0
+
+        tok_per_s = measure_steps * self.micro_batch_size * self.seq_len / dt
+        log.warning(
+            "[AUTO-TUNE] measured %.0f tok/s (%d steps in %.1fs)",
+            tok_per_s,
+            measure_steps,
+            dt,
+        )
+        return tok_per_s
+
     @torch.no_grad()
     def run_val(self) -> float | None:
         if self.val_loader is None:
@@ -481,6 +570,25 @@ class Worker:
         self.pull_state()  # captures last_ref
         self._ensure_loader_and_opt()
 
+        # Auto-tune: pick inner_steps so this worker's inner loop ≈ target wall
+        # clock, regardless of GPU speed. Lets a slow M5 and a fast 3060 finish
+        # in the same window and avoids the fast one idling on the slow one.
+        if self.auto_tune_steps:
+            tok_per_s = self._benchmark_throughput()
+            new_steps = compute_inner_steps_for_target(
+                tok_per_s,
+                self.target_round_seconds,
+                self.micro_batch_size,
+                self.seq_len,
+            )
+            log.warning(
+                "[AUTO-TUNE] target=%.0fs/round -> inner_steps=%d (coord said %d)",
+                self.target_round_seconds,
+                new_steps,
+                self.inner_steps,
+            )
+            self.inner_steps = new_steps
+
         rounds_committed = 0
         pending: Future | None = None
 
@@ -534,6 +642,17 @@ def main() -> None:
     ap.add_argument("--no-bf16", dest="bf16", action="store_false")
     ap.add_argument("--max-rounds", type=int, default=50)
     ap.add_argument(
+        "--auto-tune-steps",
+        action="store_true",
+        help="Benchmark GPU at startup, pick inner_steps to hit --target-round-seconds",
+    )
+    ap.add_argument(
+        "--target-round-seconds",
+        type=float,
+        default=90.0,
+        help="Target wall-clock per inner loop when --auto-tune-steps is on",
+    )
+    ap.add_argument(
         "--require-gpu",
         action="store_true",
         help="Fail fast if no CUDA/MPS available instead of silently falling back to CPU",
@@ -566,6 +685,8 @@ def main() -> None:
         val_data=val_data,
         bf16=args.bf16,
         val_batches=args.val_batches,
+        auto_tune_steps=args.auto_tune_steps,
+        target_round_seconds=args.target_round_seconds,
     )
     w.run(max_rounds=args.max_rounds)
 
