@@ -79,3 +79,35 @@ def test_default_tokenizer_path_under_cache() -> None:
     p = default_tokenizer_path()
     assert p.name == "tokenizer.json"
     assert "cache" in p.parts
+
+
+def test_interleave_round_robins_langs() -> None:
+    """First N docs of the interleaved stream cover all langs (one each)."""
+    from dllm.data.prepare import _interleave_docs
+
+    corpus = {"de": ["de-1", "de-2", "de-3"], "fr": ["fr-1", "fr-2"], "en": ["en-1"]}
+    out = _interleave_docs(corpus)
+    first_three = [lang for lang, _ in out[:3]]
+    assert sorted(first_three) == sorted(corpus)
+
+
+def test_interleave_preserves_all_docs() -> None:
+    from dllm.data.prepare import _interleave_docs
+
+    corpus = {"a": ["a1", "a2"], "b": ["b1", "b2", "b3"], "c": ["c1"]}
+    out = _interleave_docs(corpus)
+    assert len(out) == sum(len(d) for d in corpus.values())
+    assert {doc for _, doc in out} == {d for docs in corpus.values() for d in docs}
+
+
+def test_interleave_balances_any_contiguous_slice() -> None:
+    """A contiguous half of the interleaved stream should have every lang represented."""
+    from dllm.data.prepare import _interleave_docs
+
+    corpus = {f"l{i}": [f"l{i}-doc{j}" for j in range(20)] for i in range(5)}
+    out = _interleave_docs(corpus)
+    n = len(out)
+    first_half = {lang for lang, _ in out[: n // 2]}
+    second_half = {lang for lang, _ in out[n // 2 :]}
+    assert first_half == set(corpus)
+    assert second_half == set(corpus)

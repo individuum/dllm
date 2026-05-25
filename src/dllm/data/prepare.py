@@ -122,6 +122,26 @@ def _encode_stream(tokenizer, docs: Iterable[str], eot_id: int) -> Iterable[int]
         yield eot_id
 
 
+def _interleave_docs(corpus_per_lang: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """Round-robin docs across languages so any contiguous slice has every lang.
+
+    Without this, ShardLoader(world_size=2) gives worker 0 a different lang mix
+    than worker 1, and val (last 5%) is dominated by whichever lang sorted last.
+    """
+    iters = {lang: iter(docs) for lang, docs in corpus_per_lang.items()}
+    out: list[tuple[str, str]] = []
+    exhausted: set[str] = set()
+    while len(exhausted) < len(iters):
+        for lang, it in iters.items():
+            if lang in exhausted:
+                continue
+            try:
+                out.append((lang, next(it)))
+            except StopIteration:
+                exhausted.add(lang)
+    return out
+
+
 def tokenize_and_shard(
     corpus_per_lang: dict[str, list[str]],
     tokenizer,
@@ -132,14 +152,18 @@ def tokenize_and_shard(
     if eot_id is None:
         raise RuntimeError(f"{EOT_TOKEN!r} not in trained vocab")
 
+    interleaved = _interleave_docs(corpus_per_lang)
+    print(f"  interleaved {len(interleaved)} docs across {len(corpus_per_lang)} langs")
+
     all_ids: list[int] = []
-    tokens_per_lang: dict[str, int] = {}
-    for lang, docs in corpus_per_lang.items():
+    tokens_per_lang: dict[str, int] = {lang: 0 for lang in corpus_per_lang}
+    for lang, doc in interleaved:
         before = len(all_ids)
-        for tok in _encode_stream(tokenizer, docs, eot_id):
+        for tok in _encode_stream(tokenizer, [doc], eot_id):
             all_ids.append(tok)
-        tokens_per_lang[lang] = len(all_ids) - before
-        print(f"  tokenized {lang}: {tokens_per_lang[lang]:,} tokens")
+        tokens_per_lang[lang] += len(all_ids) - before
+    for lang, count in tokens_per_lang.items():
+        print(f"  tokenized {lang}: {count:,} tokens")
 
     if not all_ids:
         raise RuntimeError("empty corpus after tokenization")

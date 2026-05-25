@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -157,6 +158,14 @@ class Worker:
         self.val_loader: ShardLoader | None = None
         self.opt: torch.optim.Optimizer | None = None
 
+        # async sync: a single background thread submits Δ + fetches the next θ
+        # while the GPU runs the next inner loop. `last_ref` is the most recently
+        # known coord state; new deltas are computed as (last_ref - local).
+        # Lazy-async DiLoCo: local is never reset, only last_ref tracks the
+        # consensus. See arXiv:2401.09135.
+        self.last_ref: dict[str, torch.Tensor] = {}
+        self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dllm-sync")
+
     # -- registration & state sync -------------------------------------------
 
     def register(self) -> None:
@@ -234,8 +243,16 @@ class Worker:
         state = deserialize_state(r.content, codec=codec)  # type: ignore[arg-type]
         load_into_model(self.model, state)
         self.current_round = round_no
+        self._capture_ref()
         log.info("pulled state at round=%d (%d bytes, codec=%s)", round_no, len(r.content), codec)
         return round_no
+
+    def _capture_ref(self) -> None:
+        """Snapshot current model params as the reference for the next delta."""
+        with torch.no_grad():
+            self.last_ref = {
+                n: p.detach().clone() for n, p in self.model.named_parameters()
+            }
 
     # -- inner loop -----------------------------------------------------------
 
@@ -306,14 +323,14 @@ class Worker:
         self.model.train()
         return sum(losses) / len(losses)
 
-    # -- delta submission & barrier ------------------------------------------
+    # -- async sync (background thread) --------------------------------------
 
-    def submit_delta(
-        self, delta: dict[str, torch.Tensor], val_loss: float | None = None
+    def _async_sync_io(
+        self, blob: bytes, val_loss: float | None, round_no: int
     ) -> dict:
-        blob = serialize_delta(delta, codec=self.delta_codec)  # type: ignore[arg-type]
-        sig = sign_delta(self.sk, self.worker_id, self.current_round, blob)
-        params: dict = {"worker_id": self.worker_id, "round": self.current_round}
+        """Background: sign, POST /delta, wait for round advance, GET /state."""
+        sig = sign_delta(self.sk, self.worker_id, round_no, blob)
+        params: dict = {"worker_id": self.worker_id, "round": round_no}
         if val_loss is not None:
             params["val_loss"] = val_loss
         r = self.http.post(
@@ -326,38 +343,95 @@ class Worker:
             },
         )
         r.raise_for_status()
-        return r.json()
+        ack = r.json()
+        if not ack.get("accepted"):
+            return {"ack": ack, "state": None, "round": round_no, "state_bytes": 0}
 
-    def wait_for_next_round(self) -> int:
-        while True:
-            r = self.http.get("/status")
-            r.raise_for_status()
-            s = r.json()
-            if s["current_round"] > self.current_round:
-                return s["current_round"]
-            time.sleep(0.5)
+        target = ack.get("next_round")
+        if target is None:
+            # other workers haven't submitted yet — long-poll status
+            while True:
+                rs = self.http.get("/status")
+                rs.raise_for_status()
+                cur = rs.json()["current_round"]
+                if cur > round_no:
+                    break
+                time.sleep(0.5)
+
+        r2 = self.http.get("/state")
+        r2.raise_for_status()
+        codec = r2.headers.get("x-codec", self.state_codec)
+        new_state = deserialize_state(r2.content, codec=codec)  # type: ignore[arg-type]
+        return {
+            "ack": ack,
+            "state": new_state,
+            "round": int(r2.headers["x-round"]),
+            "state_bytes": len(r2.content),
+        }
+
+    def _apply_sync_result(self, result: dict) -> bool:
+        """Update last_ref to the new global. Returns True if a state was applied."""
+        state = result.get("state")
+        if state is None:
+            log.warning("sync rejected: %s", result.get("ack"))
+            return False
+        with torch.no_grad():
+            for n, ref_t in self.last_ref.items():
+                ref_t.copy_(state[n].to(ref_t.dtype).to(ref_t.device))
+        self.current_round = result["round"]
+        log.info(
+            "async sync applied round=%d (%d state bytes)",
+            self.current_round,
+            result.get("state_bytes", 0),
+        )
+        return True
 
     # -- top-level loop -------------------------------------------------------
 
     def run(self, max_rounds: int) -> None:
+        """Lazy-async DiLoCo: GPU runs continuously; network exchanges overlap."""
         self.register()
-        self.pull_state()
+        self.pull_state()  # captures last_ref
         self._ensure_loader_and_opt()
 
-        for _ in range(max_rounds):
-            delta = self.run_inner()
-            val_loss = self.run_val()
-            if val_loss is not None:
-                log.info("val round=%d loss=%.4f", self.current_round, val_loss)
-            ack = self.submit_delta(delta, val_loss=val_loss)
-            if not ack["accepted"]:
-                log.warning("delta rejected: %s", ack.get("reason"))
-                if ack.get("next_round") is not None and ack["next_round"] > self.current_round:
-                    self.pull_state()
-                continue
-            if ack.get("next_round") is None:
-                _ = self.wait_for_next_round()
-            self.pull_state()
+        rounds_committed = 0
+        pending: Future | None = None
+
+        try:
+            while rounds_committed < max_rounds:
+                # GPU: inner steps then val on the current local θ
+                self.run_inner()
+                val_loss = self.run_val()
+                if val_loss is not None:
+                    log.info("val round=%d loss=%.4f", self.current_round, val_loss)
+
+                # finalize previous round's sync (blocks if network slower than compute)
+                if pending is not None:
+                    result = pending.result()
+                    pending = None
+                    if not self._apply_sync_result(result):
+                        log.error("sync failed; stopping early")
+                        break
+                    rounds_committed += 1
+                    if rounds_committed >= max_rounds:
+                        break
+
+                # delta = last known global − current local; sent for the next outer step
+                delta = compute_delta(self.last_ref, self.model)
+                blob = serialize_delta(delta, codec=self.delta_codec)  # type: ignore[arg-type]
+
+                # kick off async sync — next inner loop runs in parallel
+                pending = self._exec.submit(
+                    self._async_sync_io, blob, val_loss, self.current_round
+                )
+
+            # drain any in-flight sync
+            if pending is not None:
+                log.info("draining final sync...")
+                if self._apply_sync_result(pending.result()):
+                    rounds_committed += 1
+        finally:
+            self._exec.shutdown(wait=False)
 
 
 def main() -> None:
