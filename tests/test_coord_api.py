@@ -233,3 +233,131 @@ def test_status_reports_flops_and_val(state: CoordinatorState) -> None:
     assert "flops_total" in body
     assert "last_val_loss" in body
     assert body["flops_total"] == 0.0  # nothing trained yet
+
+
+# ---------------------------------------------------------------------------
+# signed-delta enforcement (Phase 1 Byzantine-prep)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def signed_state(tmp_path: Path) -> CoordinatorState:
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    return CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        require_signed_deltas=True,
+    )
+
+
+def _make_dummy_delta(state: CoordinatorState):
+    """Build a small valid delta payload from the state's model."""
+    snap = snapshot(state.model)
+    with torch.no_grad():
+        for p in state.model.parameters():
+            p.add_(torch.randn_like(p) * 0.001)
+    delta = compute_delta(snap, state.model)
+    with torch.no_grad():
+        for n, p in state.model.named_parameters():
+            p.copy_(snap[n])
+    from dllm.shared.serialize import state_to_bytes
+
+    return state_to_bytes(delta)
+
+
+def test_signed_required_register_rejects_bad_pubkey(signed_state: CoordinatorState) -> None:
+    client = TestClient(create_app(signed_state))
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey="not-hex!!", preset="smoke").model_dump(),
+    )
+    assert r.status_code == 400
+
+
+def test_signed_required_rejects_unsigned_delta(signed_state: CoordinatorState) -> None:
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex
+
+    client = TestClient(create_app(signed_state))
+    sk = load_or_create_identity(Path("tests_tmp_key_a"))
+    try:
+        client.post(
+            "/register",
+            json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        )
+        body = _make_dummy_delta(signed_state)
+        ack = client.post(
+            "/delta",
+            params={"worker_id": 0, "round": 0},
+            content=body,
+            headers={"content-type": "application/octet-stream"},
+        )
+        assert ack.json()["accepted"] is False
+        assert "signature" in ack.json()["reason"].lower()
+    finally:
+        Path("tests_tmp_key_a").unlink(missing_ok=True)
+
+
+def test_signed_required_accepts_valid_signature(signed_state: CoordinatorState) -> None:
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_delta
+
+    client = TestClient(create_app(signed_state))
+    sk = load_or_create_identity(Path("tests_tmp_key_b"))
+    try:
+        client.post(
+            "/register",
+            json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        )
+        body = _make_dummy_delta(signed_state)
+        sig = sign_delta(sk, worker_id=0, round_no=0, body=body)
+        ack = client.post(
+            "/delta",
+            params={"worker_id": 0, "round": 0},
+            content=body,
+            headers={
+                "content-type": "application/octet-stream",
+                "x-delta-signature": sig,
+            },
+        )
+        assert ack.json()["accepted"] is True
+        assert ack.json()["next_round"] == 1
+    finally:
+        Path("tests_tmp_key_b").unlink(missing_ok=True)
+
+
+def test_signed_required_rejects_other_workers_signature(signed_state: CoordinatorState) -> None:
+    """Worker A registers, worker B signs A's delta with B's key — must reject."""
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_delta
+
+    client = TestClient(create_app(signed_state))
+    sk_a = load_or_create_identity(Path("tests_tmp_key_c"))
+    sk_b = load_or_create_identity(Path("tests_tmp_key_d"))
+    try:
+        # A registers as worker_id=0
+        client.post(
+            "/register",
+            json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump(),
+        )
+        body = _make_dummy_delta(signed_state)
+        # B signs claiming to be A — signature won't verify against A's pubkey
+        sig_b = sign_delta(sk_b, worker_id=0, round_no=0, body=body)
+        ack = client.post(
+            "/delta",
+            params={"worker_id": 0, "round": 0},
+            content=body,
+            headers={
+                "content-type": "application/octet-stream",
+                "x-delta-signature": sig_b,
+            },
+        )
+        assert ack.json()["accepted"] is False
+        assert "signature" in ack.json()["reason"].lower()
+    finally:
+        Path("tests_tmp_key_c").unlink(missing_ok=True)
+        Path("tests_tmp_key_d").unlink(missing_ok=True)

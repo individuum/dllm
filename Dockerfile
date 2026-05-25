@@ -23,12 +23,13 @@ ENTRYPOINT ["dllm-coord"]
 CMD [ \
     "--host", "0.0.0.0", \
     "--port", "8000", \
-    "--preset", "smoke", \
+    "--preset", "124M", \
     "--world-size", "1", \
-    "--inner-steps", "30", \
-    "--seq-len", "128", \
-    "--micro-batch-size", "16", \
+    "--inner-steps", "500", \
+    "--seq-len", "512", \
+    "--micro-batch-size", "8", \
     "--checkpoint-dir", "/data/checkpoints", \
-    "--checkpoint-every", "5", \
+    "--checkpoint-every", "10", \
+    "--require-signed-deltas", \
     "--device", "cpu" \
 ]

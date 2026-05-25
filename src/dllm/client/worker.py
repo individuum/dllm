@@ -23,6 +23,11 @@ except AttributeError:
 
 from ..core import PRESETS, Transformer
 from ..data.loader import ShardLoader
+from ..shared.identity import (
+    load_or_create_identity,
+    pubkey_hex,
+    sign_delta,
+)
 from ..shared.protocol import RegisterRequest
 from ..shared.serialize import (
     compute_delta,
@@ -119,6 +124,11 @@ class Worker:
         self.bf16 = bf16 and device.type == "cuda"
         self.val_batches = val_batches
 
+        # Ed25519 identity — persisted in .dllm/identity.key
+        self.sk = load_or_create_identity()
+        self.pubkey_hex = pubkey_hex(self.sk)
+        log.info("identity pubkey: %s", self.pubkey_hex[:16] + "...")
+
         log_device_banner(device)
 
         cfg = PRESETS[preset]
@@ -152,7 +162,7 @@ class Worker:
     def register(self) -> None:
         name, vram = gpu_info(self.device)
         req = RegisterRequest(
-            pubkey=f"phase0-{os.getpid()}",
+            pubkey=self.pubkey_hex,
             country=self.country,
             gpu=name,
             vram_gb=vram,
@@ -302,6 +312,7 @@ class Worker:
         self, delta: dict[str, torch.Tensor], val_loss: float | None = None
     ) -> dict:
         blob = serialize_delta(delta, codec=self.delta_codec)  # type: ignore[arg-type]
+        sig = sign_delta(self.sk, self.worker_id, self.current_round, blob)
         params: dict = {"worker_id": self.worker_id, "round": self.current_round}
         if val_loss is not None:
             params["val_loss"] = val_loss
@@ -309,7 +320,10 @@ class Worker:
             "/delta",
             params=params,
             content=blob,
-            headers={"content-type": "application/octet-stream"},
+            headers={
+                "content-type": "application/octet-stream",
+                "x-delta-signature": sig,
+            },
         )
         r.raise_for_status()
         return r.json()

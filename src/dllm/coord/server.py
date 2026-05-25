@@ -29,6 +29,7 @@ except AttributeError:
 
 from ..core import PRESETS, ModelConfig, Transformer
 from ..core.config import TrainConfig
+from ..shared.identity import pubkey_from_hex, verify_delta
 from ..shared.protocol import DeltaAck, RegisterRequest, RegisterResponse, RoundStatus
 from ..shared.serialize import (
     DeltaCodec,
@@ -57,6 +58,7 @@ class CoordinatorState:
         checkpoint_dir: Path | None = None,
         checkpoint_every: int = 10,
         resume: bool = True,
+        require_signed_deltas: bool = False,
     ) -> None:
         if preset_name not in PRESETS:
             raise ValueError(f"unknown preset {preset_name!r}; have {list(PRESETS)}")
@@ -69,6 +71,7 @@ class CoordinatorState:
         self.delta_codec: DeltaCodec = delta_codec
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_every = checkpoint_every
+        self.require_signed_deltas = require_signed_deltas
 
         torch.manual_seed(train_cfg.seed)
         self.model = Transformer(self.cfg).to(self.device)
@@ -93,12 +96,20 @@ class CoordinatorState:
         if resume and self.checkpoint_dir is not None:
             latest = find_latest(self.checkpoint_dir)
             if latest is not None:
-                meta = load_checkpoint(latest, self.model, self.outer_opt)
-                self.round = int(meta.get("round", 0)) + 1
-                self.flops_total = float(meta.get("flops_total", 0.0))
-                self.deltas = {self.round: {}}
-                self.val_losses = {self.round: []}
-                log.info("resumed from %s -> starting at round %d", latest, self.round)
+                try:
+                    meta = load_checkpoint(latest, self.model, self.outer_opt)
+                    self.round = int(meta.get("round", 0)) + 1
+                    self.flops_total = float(meta.get("flops_total", 0.0))
+                    self.deltas = {self.round: {}}
+                    self.val_losses = {self.round: []}
+                    log.info("resumed from %s -> starting at round %d", latest, self.round)
+                except (KeyError, ValueError, RuntimeError) as e:
+                    log.warning(
+                        "checkpoint %s incompatible with current preset (%s); "
+                        "starting fresh at round 0",
+                        latest,
+                        e,
+                    )
 
     # -- helpers --------------------------------------------------------------
 
@@ -130,10 +141,22 @@ class CoordinatorState:
                     status_code=400,
                     detail=f"preset mismatch: coord={self.preset_name}, worker={req.preset}",
                 )
+            # parse pubkey eagerly so bad keys fail at registration, not at /delta
+            parsed_pubkey = None
+            if req.pubkey:
+                try:
+                    parsed_pubkey = pubkey_from_hex(req.pubkey)
+                except (ValueError, TypeError) as e:
+                    if self.require_signed_deltas:
+                        raise HTTPException(400, f"invalid pubkey: {e}") from None
+            elif self.require_signed_deltas:
+                raise HTTPException(400, "pubkey required when signed deltas enforced")
+
             wid = self.next_worker_id
             self.next_worker_id += 1
             self.workers[wid] = {
-                "pubkey": req.pubkey,
+                "pubkey_hex": req.pubkey,
+                "pubkey": parsed_pubkey,
                 "country": req.country,
                 "gpu": req.gpu,
                 "vram_gb": req.vram_gb,
@@ -157,6 +180,7 @@ class CoordinatorState:
                 micro_batch_size=self.train_cfg.micro_batch_size,
                 state_codec=self.state_codec,
                 delta_codec=self.delta_codec,
+                require_signed_deltas=self.require_signed_deltas,
             )
 
     def status(self) -> RoundStatus:
@@ -181,6 +205,7 @@ class CoordinatorState:
         claimed_round: int,
         blob: bytes,
         val_loss: float | None = None,
+        signature_b64: str | None = None,
     ) -> DeltaAck:
         with self.lock:
             if worker_id not in self.workers:
@@ -191,6 +216,19 @@ class CoordinatorState:
                     reason=f"stale: coord round={self.round}, worker={claimed_round}",
                     next_round=self.round,
                 )
+            # signature check (binds worker_id + round + sha256(body) to the pubkey
+            # registered at /register time, defeating spoof + replay + tamper)
+            pubkey = self.workers[worker_id].get("pubkey")
+            if self.require_signed_deltas or signature_b64 is not None:
+                if signature_b64 is None:
+                    return DeltaAck(accepted=False, reason="missing signature")
+                if pubkey is None:
+                    return DeltaAck(accepted=False, reason="worker registered without pubkey")
+                if not verify_delta(pubkey, worker_id, claimed_round, blob, signature_b64):
+                    log.warning(
+                        "REJECTED bad signature from worker_id=%d round=%d", worker_id, claimed_round
+                    )
+                    return DeltaAck(accepted=False, reason="signature verification failed")
             delta = deserialize_delta(blob, codec=self.delta_codec)
             self.deltas[self.round][worker_id] = delta
             if val_loss is not None:
@@ -324,7 +362,10 @@ def create_app(state: CoordinatorState) -> FastAPI:
         val_loss: float | None = None,
     ):
         body = await request.body()
-        ack = state.submit_delta(worker_id, round, body, val_loss=val_loss)
+        sig = request.headers.get("x-delta-signature")
+        ack = state.submit_delta(
+            worker_id, round, body, val_loss=val_loss, signature_b64=sig
+        )
         return JSONResponse(ack.model_dump())
 
     return app
@@ -350,6 +391,11 @@ def main() -> None:
     ap.add_argument("--checkpoint-dir", default="coord/state")
     ap.add_argument("--checkpoint-every", type=int, default=10)
     ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument(
+        "--require-signed-deltas",
+        action="store_true",
+        help="Reject /delta submissions without a valid Ed25519 signature (recommended)",
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -381,6 +427,7 @@ def main() -> None:
         checkpoint_dir=ckpt_dir,
         checkpoint_every=args.checkpoint_every,
         resume=not args.no_resume,
+        require_signed_deltas=args.require_signed_deltas,
     )
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

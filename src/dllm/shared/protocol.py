@@ -22,6 +22,7 @@ class RegisterResponse(BaseModel):
     micro_batch_size: int
     state_codec: str = "bf16"  # "fp32" or "bf16"
     delta_codec: str = "q8"  # "fp32" or "q8"
+    require_signed_deltas: bool = False  # if True, worker must sign /delta bodies
 
 
 class RoundStatus(BaseModel):

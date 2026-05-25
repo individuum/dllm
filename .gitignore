@@ -34,3 +34,6 @@ Thumbs.db
 
 # Claude Code harness per-machine config
 .claude/
+
+# Worker identity (Ed25519 private key) — never commit
+.dllm/
