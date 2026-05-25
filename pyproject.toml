@@ -29,6 +29,13 @@ dev = [
     "ruff>=0.6",
     "pytest>=8.0",
 ]
+# `[data]` extras are only needed to PREPARE the corpus (HuggingFace streaming
+# downloads + BPE training). Coord and worker images don't need these at
+# runtime — they consume pre-tokenized .bin files + tokenizer.json.
+data = [
+    "datasets>=2.20",
+    "tokenizers>=0.20",
+]
 
 [project.scripts]
 dllm-coord = "dllm.coord.server:main"

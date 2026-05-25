@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, asdict
 
 @dataclass(frozen=True)
 class ModelConfig:
-    vocab_size: int = 50304
+    vocab_size: int = 32768
     dim: int = 768
     n_layers: int = 12
     n_heads: int = 12
