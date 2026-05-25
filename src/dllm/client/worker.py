@@ -50,7 +50,8 @@ def pick_device(requested: str, require_gpu: bool = False) -> torch.device:
         if require_gpu:
             raise SystemExit(
                 "[GPU CHECK] FAIL: --require-gpu set but no CUDA/MPS available. "
-                f"torch={torch.__version__} cuda_available={torch.cuda.is_available()}"
+                f"torch={torch.__version__} cuda_available={torch.cuda.is_available()} "
+                f"mps_available={torch.backends.mps.is_available()}"
             )
         return torch.device("cpu")
     dev = torch.device(requested)
@@ -61,7 +62,35 @@ def pick_device(requested: str, require_gpu: bool = False) -> torch.device:
             f"[GPU CHECK] FAIL: requested {dev} but torch.cuda.is_available()=False. "
             f"You have torch={torch.__version__} — likely a CPU-only build."
         )
+    if dev.type == "mps" and not torch.backends.mps.is_available():
+        raise SystemExit(
+            f"[GPU CHECK] FAIL: requested {dev} but torch.backends.mps.is_available()=False. "
+            f"Needs Apple Silicon + macOS 12.3+ + a recent PyTorch."
+        )
     return dev
+
+
+def _apple_chip_info() -> tuple[str, int]:
+    """Return (chip name, unified memory GB) on macOS. ('Apple Silicon', 0) on failure."""
+    import platform
+    import subprocess
+
+    if platform.system() != "Darwin":
+        return "Apple Silicon", 0
+    try:
+        chip = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
+        ).strip()
+    except Exception:  # noqa: BLE001
+        chip = "Apple Silicon"
+    try:
+        mem_bytes = int(
+            subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+        )
+        mem_gb = mem_bytes // (1024**3)
+    except Exception:  # noqa: BLE001
+        mem_gb = 0
+    return chip, mem_gb
 
 
 def gpu_info(device: torch.device) -> tuple[str, int]:
@@ -69,6 +98,8 @@ def gpu_info(device: torch.device) -> tuple[str, int]:
         idx = device.index or 0
         props = torch.cuda.get_device_properties(idx)
         return props.name, props.total_memory // (1024**3)
+    if device.type == "mps":
+        return _apple_chip_info()
     return device.type, 0
 
 
@@ -86,13 +117,20 @@ def log_device_banner(device: torch.device) -> None:
             torch.__version__,
         )
     elif device.type == "mps":
-        log.warning("[GPU CHECK] OK: device=mps (Apple Metal) torch=%s", torch.__version__)
+        chip, unified_gb = _apple_chip_info()
+        log.warning(
+            "[GPU CHECK] OK: device=mps name=%s unified_memory=%d GB torch=%s",
+            chip,
+            unified_gb,
+            torch.__version__,
+        )
     else:
         log.warning(
-            "[GPU CHECK] WARNING: running on CPU. torch=%s cuda_available=%s. "
+            "[GPU CHECK] WARNING: running on CPU. torch=%s cuda_available=%s mps_available=%s. "
             "If you expected GPU, pass --require-gpu to fail fast next time.",
             torch.__version__,
             torch.cuda.is_available(),
+            torch.backends.mps.is_available(),
         )
 
 
@@ -122,7 +160,10 @@ class Worker:
         self.device = device
         self.train_data = train_data
         self.val_data = val_data
-        self.bf16 = bf16 and device.type == "cuda"
+        # bf16 autocast on CUDA (Ampere+) and MPS (PyTorch 2.5+ on Apple Silicon).
+        # On older MPS where bf16 is rejected, the run_inner autocast will surface
+        # an error and the user can rerun with --no-bf16.
+        self.bf16 = bf16 and device.type in ("cuda", "mps")
         self.val_batches = val_batches
 
         # Ed25519 identity — persisted in .dllm/identity.key
@@ -140,6 +181,9 @@ class Worker:
             torch.cuda.reset_peak_memory_stats(device)
             alloc = torch.cuda.memory_allocated(device) / (1024**2)
             log.info("VRAM after model load: %.1f MiB allocated on %s", alloc, device)
+        elif device.type == "mps":
+            alloc = torch.mps.current_allocated_memory() / (1024**2)
+            log.info("unified mem after model load: %.1f MiB allocated on %s", alloc, device)
 
         self.http = httpx.Client(base_url=self.coord_url, timeout=httpx.Timeout(120.0))
 
@@ -262,7 +306,7 @@ class Worker:
         snap = snapshot(self.model)
 
         autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
             if self.bf16
             else _nullcontext()
         )
@@ -293,6 +337,17 @@ class Worker:
                 peak_mib,
             )
             torch.cuda.reset_peak_memory_stats(self.device)
+        elif self.device.type == "mps":
+            # MPS reports current rather than peak; close enough at end-of-loop
+            mem_mib = torch.mps.current_allocated_memory() / (1024**2)
+            log.info(
+                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s mem=%.1f MiB (MPS)",
+                self.current_round,
+                avg_loss,
+                self.inner_steps,
+                tok_per_s,
+                mem_mib,
+            )
         else:
             log.info(
                 "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s (CPU)",
@@ -310,7 +365,7 @@ class Worker:
             return None
         self.model.eval()
         autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
             if self.bf16
             else _nullcontext()
         )

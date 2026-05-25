@@ -38,3 +38,28 @@ def test_pick_device_auto_picks_cuda_when_available(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     dev = pick_device("auto")
     assert dev.type == "cuda"
+
+
+def test_pick_device_auto_falls_through_to_mps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    dev = pick_device("auto")
+    assert dev.type == "mps"
+
+
+def test_pick_device_explicit_mps_without_support_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        pick_device("mps")
+    assert "GPU CHECK" in str(exc.value)
+
+
+def test_pick_device_auto_with_mps_satisfies_require_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    dev = pick_device("auto", require_gpu=True)  # MPS counts as a GPU
+    assert dev.type == "mps"
