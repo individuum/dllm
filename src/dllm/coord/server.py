@@ -1,0 +1,390 @@
+"""Phase 0.5 coordinator.
+
+Holds the global model state; collects pseudo-gradient deltas from N workers;
+applies a Nesterov outer step when all workers in the current round have submitted.
+Supports bf16 state transport + q8 delta transport, periodic disk checkpoints,
+val-loss aggregation, and cumulative FLOPs accounting.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
+
+from ..core import PRESETS, ModelConfig, Transformer
+from ..core.config import TrainConfig
+from ..shared.protocol import DeltaAck, RegisterRequest, RegisterResponse, RoundStatus
+from ..shared.serialize import (
+    DeltaCodec,
+    StateCodec,
+    average_deltas,
+    deserialize_delta,
+    model_state,
+    serialize_state,
+)
+from .persistence import find_latest, load_checkpoint, save_checkpoint
+
+log = logging.getLogger("dllm.coord")
+
+
+class CoordinatorState:
+    """All mutable global state; guarded by `lock`."""
+
+    def __init__(
+        self,
+        preset_name: str,
+        world_size: int,
+        train_cfg: TrainConfig,
+        device: str = "cpu",
+        state_codec: StateCodec = "bf16",
+        delta_codec: DeltaCodec = "q8",
+        checkpoint_dir: Path | None = None,
+        checkpoint_every: int = 10,
+        resume: bool = True,
+    ) -> None:
+        if preset_name not in PRESETS:
+            raise ValueError(f"unknown preset {preset_name!r}; have {list(PRESETS)}")
+        self.preset_name = preset_name
+        self.cfg: ModelConfig = PRESETS[preset_name]
+        self.train_cfg = train_cfg
+        self.world_size = world_size
+        self.device = torch.device(device)
+        self.state_codec: StateCodec = state_codec
+        self.delta_codec: DeltaCodec = delta_codec
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_every = checkpoint_every
+
+        torch.manual_seed(train_cfg.seed)
+        self.model = Transformer(self.cfg).to(self.device)
+        self.outer_opt = torch.optim.SGD(
+            self.model.parameters(),
+            lr=train_cfg.outer_lr,
+            momentum=train_cfg.outer_momentum,
+            nesterov=True,
+        )
+
+        self.lock = threading.Lock()
+        self.round = 0
+        self.next_worker_id = 0
+        self.workers: dict[int, dict[str, Any]] = {}
+        self.deltas: dict[int, dict[int, dict[str, torch.Tensor]]] = {0: {}}
+        self.val_losses: dict[int, list[float]] = {0: []}
+        self.last_val_loss: float | None = None
+        self.flops_total: float = 0.0  # cumulative estimate
+        self.round_started_at = time.time()
+        self._state_bytes: bytes | None = None
+
+        if resume and self.checkpoint_dir is not None:
+            latest = find_latest(self.checkpoint_dir)
+            if latest is not None:
+                meta = load_checkpoint(latest, self.model, self.outer_opt)
+                self.round = int(meta.get("round", 0)) + 1
+                self.flops_total = float(meta.get("flops_total", 0.0))
+                self.deltas = {self.round: {}}
+                self.val_losses = {self.round: []}
+                log.info("resumed from %s -> starting at round %d", latest, self.round)
+
+    # -- helpers --------------------------------------------------------------
+
+    def _serialize_state(self) -> bytes:
+        if self._state_bytes is None:
+            self._state_bytes = serialize_state(model_state(self.model), codec=self.state_codec)
+        return self._state_bytes
+
+    def _invalidate_state_cache(self) -> None:
+        self._state_bytes = None
+
+    def _estimate_round_flops(self) -> float:
+        """Crude FLOPs estimate: 6 * N_params * tokens_per_round * world_size.
+
+        6 = 2 (forward) + 4 (backward) per param per token. Coarse but tracks
+        the right order of magnitude — enough for AI-Act-threshold monitoring.
+        """
+        n_params = float(self.model.num_params(non_embedding=False))
+        toks_per_step = self.train_cfg.seq_len * self.train_cfg.micro_batch_size
+        toks_per_round = toks_per_step * self.train_cfg.inner_steps
+        return 6.0 * n_params * toks_per_round * float(self.world_size)
+
+    # -- API used by FastAPI handlers ----------------------------------------
+
+    def register(self, req: RegisterRequest) -> RegisterResponse:
+        with self.lock:
+            if req.preset != self.preset_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"preset mismatch: coord={self.preset_name}, worker={req.preset}",
+                )
+            wid = self.next_worker_id
+            self.next_worker_id += 1
+            self.workers[wid] = {
+                "pubkey": req.pubkey,
+                "country": req.country,
+                "gpu": req.gpu,
+                "vram_gb": req.vram_gb,
+                "ram_gb": req.ram_gb,
+                "registered_at": time.time(),
+            }
+            log.info(
+                "register worker=%d country=%s gpu=%s preset=%s",
+                wid,
+                req.country,
+                req.gpu,
+                req.preset,
+            )
+            return RegisterResponse(
+                worker_id=wid,
+                current_round=self.round,
+                world_size=self.world_size,
+                seed=self.train_cfg.seed,
+                inner_steps=self.train_cfg.inner_steps,
+                seq_len=self.train_cfg.seq_len,
+                micro_batch_size=self.train_cfg.micro_batch_size,
+                state_codec=self.state_codec,
+                delta_codec=self.delta_codec,
+            )
+
+    def status(self) -> RoundStatus:
+        with self.lock:
+            n_sub = len(self.deltas.get(self.round, {}))
+            return RoundStatus(
+                current_round=self.round,
+                n_registered=len(self.workers),
+                n_submitted=n_sub,
+                waiting_for=max(0, self.world_size - n_sub),
+                last_val_loss=self.last_val_loss,
+                flops_total=self.flops_total,
+            )
+
+    def state_blob(self) -> tuple[bytes, int]:
+        with self.lock:
+            return self._serialize_state(), self.round
+
+    def submit_delta(
+        self,
+        worker_id: int,
+        claimed_round: int,
+        blob: bytes,
+        val_loss: float | None = None,
+    ) -> DeltaAck:
+        with self.lock:
+            if worker_id not in self.workers:
+                raise HTTPException(404, f"unknown worker_id {worker_id}")
+            if claimed_round != self.round:
+                return DeltaAck(
+                    accepted=False,
+                    reason=f"stale: coord round={self.round}, worker={claimed_round}",
+                    next_round=self.round,
+                )
+            delta = deserialize_delta(blob, codec=self.delta_codec)
+            self.deltas[self.round][worker_id] = delta
+            if val_loss is not None:
+                self.val_losses[self.round].append(val_loss)
+            log.info(
+                "delta round=%d worker=%d (%d/%d)%s",
+                self.round,
+                worker_id,
+                len(self.deltas[self.round]),
+                self.world_size,
+                f" val_loss={val_loss:.4f}" if val_loss is not None else "",
+            )
+            ready = len(self.deltas[self.round]) >= self.world_size
+            if ready:
+                self._outer_step_locked()
+                return DeltaAck(accepted=True, next_round=self.round)
+            return DeltaAck(accepted=True)
+
+    # -- outer optimizer step (caller holds lock) -----------------------------
+
+    def _outer_step_locked(self) -> None:
+        round_deltas = list(self.deltas[self.round].values())
+        avg = average_deltas(round_deltas)
+
+        self.outer_opt.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if n not in avg:
+                    raise KeyError(f"missing delta for parameter {n!r}")
+                g = avg[n].to(p.device, dtype=p.dtype)
+                p.grad = g
+        self.outer_opt.step()
+
+        # bookkeeping
+        if self.val_losses[self.round]:
+            self.last_val_loss = sum(self.val_losses[self.round]) / len(
+                self.val_losses[self.round]
+            )
+        self.flops_total += self._estimate_round_flops()
+
+        prev_round = self.round
+        self.round += 1
+        self.deltas[self.round] = {}
+        self.val_losses[self.round] = []
+        del self.deltas[prev_round]
+        del self.val_losses[prev_round]
+        self.round_started_at = time.time()
+        self._invalidate_state_cache()
+
+        log.info(
+            "outer step %d -> %d (avg delta norm: %.4f, FLOPs ~%.2e, last_val_loss=%s)",
+            prev_round,
+            self.round,
+            _flat_norm(avg),
+            self.flops_total,
+            f"{self.last_val_loss:.4f}" if self.last_val_loss is not None else "n/a",
+        )
+
+        if (
+            self.checkpoint_dir is not None
+            and self.checkpoint_every > 0
+            and self.round % self.checkpoint_every == 0
+        ):
+            save_checkpoint(
+                self.checkpoint_dir,
+                round_no=self.round - 1,
+                model=self.model,
+                outer_opt=self.outer_opt,
+                meta={
+                    "preset_name": self.preset_name,
+                    "world_size": self.world_size,
+                    "flops_total": self.flops_total,
+                    "last_val_loss": self.last_val_loss,
+                },
+            )
+
+
+def _flat_norm(state: dict[str, torch.Tensor]) -> float:
+    total = 0.0
+    for t in state.values():
+        total += float(t.float().pow(2).sum().item())
+    return total**0.5
+
+
+# -- FastAPI wiring -----------------------------------------------------------
+
+
+def create_app(state: CoordinatorState) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        log.info(
+            "coord up: preset=%s world_size=%d params=%d state_codec=%s delta_codec=%s",
+            state.preset_name,
+            state.world_size,
+            state.model.num_params(),
+            state.state_codec,
+            state.delta_codec,
+        )
+        yield
+
+    app = FastAPI(title="dllm-coordinator", version="0.0.2", lifespan=lifespan)
+
+    @app.get("/health")
+    def health() -> dict:
+        return {"ok": True, "round": state.round}
+
+    @app.post("/register", response_model=RegisterResponse)
+    def register(req: RegisterRequest) -> RegisterResponse:
+        return state.register(req)
+
+    @app.get("/status", response_model=RoundStatus)
+    def status() -> RoundStatus:
+        return state.status()
+
+    @app.get("/state")
+    def get_state():
+        blob, round_no = state.state_blob()
+        return Response(
+            content=blob,
+            media_type="application/octet-stream",
+            headers={"x-round": str(round_no), "x-codec": state.state_codec},
+        )
+
+    @app.post("/delta")
+    async def post_delta(
+        request: Request,
+        worker_id: int,
+        round: int,
+        val_loss: float | None = None,
+    ):
+        body = await request.body()
+        ack = state.submit_delta(worker_id, round, body, val_loss=val_loss)
+        return JSONResponse(ack.model_dump())
+
+    return app
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preset", default="smoke", choices=list(PRESETS))
+    ap.add_argument("--world-size", type=int, default=2)
+    ap.add_argument("--inner-steps", type=int, default=50)
+    ap.add_argument("--seq-len", type=int, default=256)
+    ap.add_argument("--micro-batch-size", type=int, default=16)
+    ap.add_argument("--inner-lr", type=float, default=3e-4)
+    ap.add_argument("--outer-lr", type=float, default=0.7)
+    ap.add_argument("--outer-momentum", type=float, default=0.9)
+    ap.add_argument("--max-rounds", type=int, default=50)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--state-codec", default="bf16", choices=["fp32", "bf16"])
+    ap.add_argument("--delta-codec", default="q8", choices=["fp32", "q8"])
+    ap.add_argument("--checkpoint-dir", default="coord/state")
+    ap.add_argument("--checkpoint-every", type=int, default=10)
+    ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--log-level", default="info")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    train_cfg = TrainConfig(
+        seq_len=args.seq_len,
+        micro_batch_size=args.micro_batch_size,
+        inner_steps=args.inner_steps,
+        inner_lr=args.inner_lr,
+        outer_lr=args.outer_lr,
+        outer_momentum=args.outer_momentum,
+        max_outer_rounds=args.max_rounds,
+        seed=args.seed,
+    )
+
+    ckpt_dir = Path(args.checkpoint_dir).resolve() if args.checkpoint_dir else None
+
+    state = CoordinatorState(
+        preset_name=args.preset,
+        world_size=args.world_size,
+        train_cfg=train_cfg,
+        device=args.device,
+        state_codec=args.state_codec,
+        delta_codec=args.delta_codec,
+        checkpoint_dir=ckpt_dir,
+        checkpoint_every=args.checkpoint_every,
+        resume=not args.no_resume,
+    )
+    app = create_app(state)
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.envrc
+
+# data + checkpoints (large binary)
+data/cache/
+data/*.bin
+data/*.idx
+checkpoints/
+runs/
+*.safetensors
+*.pt
+*.ckpt
+
+# coordinator state (machine-local)
+coord/state/
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# build
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code harness per-machine config
+.claude/

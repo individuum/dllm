@@ -1,0 +1,21 @@
+[Unit]
+Description=DLLM coordinator (Phase 0.5)
+Documentation=https://dllm.planetbass.de/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+ExecStartPre=-/usr/bin/podman rm -f dllm-coord
+ExecStart=/usr/bin/podman run --rm --replace --name dllm-coord \
+    -p 127.0.0.1:18790:8000 \
+    -v dllm-data:/data:Z \
+    --log-driver=journald \
+    localhost/dllm:local
+ExecStop=/usr/bin/podman stop -t 10 dllm-coord
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
