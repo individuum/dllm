@@ -12,6 +12,7 @@ import logging
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,9 @@ from typing import Any
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+
+_DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -82,6 +85,9 @@ class CoordinatorState:
         # resync path on the worker side.
         self.round_timeout_seconds = max(0.0, round_timeout_seconds)
         self.min_workers = max(1, min(min_workers, world_size))
+        # Ring buffer of (round, val_loss, flops_total, ts) appended at each
+        # outer step. Powers the dashboard chart at GET /.
+        self.history: deque[dict] = deque(maxlen=500)
 
         torch.manual_seed(train_cfg.seed)
         self.model = Transformer(self.cfg).to(self.device)
@@ -344,6 +350,16 @@ class CoordinatorState:
         self.round_started_at = time.time()
         self._invalidate_state_cache()
 
+        # record for the dashboard's loss-curve chart
+        self.history.append(
+            {
+                "round": prev_round,
+                "val_loss": self.last_val_loss,
+                "flops_total": self.flops_total,
+                "ts": time.time(),
+            }
+        )
+
         log.info(
             "outer step %d -> %d (avg delta norm: %.4f, FLOPs ~%.2e, last_val_loss=%s)",
             prev_round,
@@ -397,9 +413,18 @@ def create_app(state: CoordinatorState) -> FastAPI:
 
     app = FastAPI(title="dllm-coordinator", version="0.0.2", lifespan=lifespan)
 
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(_DASHBOARD_HTML)
+
     @app.get("/health")
     def health() -> dict:
         return {"ok": True, "round": state.round}
+
+    @app.get("/history")
+    def get_history() -> dict:
+        with state.lock:
+            return {"history": list(state.history)}
 
     @app.post("/register", response_model=RegisterResponse)
     def register(req: RegisterRequest) -> RegisterResponse:

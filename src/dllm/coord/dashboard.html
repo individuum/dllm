@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dllm coordinator</title>
+  <style>
+    :root {
+      --bg: #fafafa; --fg: #111; --muted: #666; --card: #fff;
+      --border: #e5e5e5; --accent: #2563eb; --good: #16a34a; --warn: #d97706;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0b0d10; --fg: #e5e7eb; --muted: #9ca3af; --card: #161a1f;
+              --border: #2a313a; --accent: #60a5fa; --good: #4ade80; --warn: #fbbf24; }
+    }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+           background: var(--bg); color: var(--fg); margin: 0;
+           padding: 1.5rem; max-width: 1300px; margin: 0 auto; line-height: 1.5; }
+    h1 { margin: 0 0 1.5rem; font-size: 1.5rem; display: flex; align-items: baseline; gap: .75rem; }
+    h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em;
+         color: var(--muted); margin: 2rem 0 .75rem; }
+    .live { font-size: .85rem; color: var(--good); }
+    .live::before { content: "● "; animation: blink 2s infinite; }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+    .stale .live { color: var(--warn); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1rem; }
+    .card { background: var(--card); border: 1px solid var(--border);
+            border-radius: 8px; padding: 1rem; }
+    .card .label { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em;
+                   color: var(--muted); margin-bottom: .35rem; }
+    .card .value { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .card .sub { font-size: .8rem; color: var(--muted); margin-top: .25rem; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem;
+            font-variant-numeric: tabular-nums; }
+    th, td { padding: .5rem .75rem; text-align: left; border-bottom: 1px solid var(--border); }
+    th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em;
+         color: var(--muted); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .chart-wrap { background: var(--card); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 1rem; }
+    svg { width: 100%; height: 320px; display: block; }
+    .footer { color: var(--muted); font-size: .8rem; margin-top: 2rem;
+              padding-top: 1rem; border-top: 1px solid var(--border); }
+    code { font-family: ui-monospace, Menlo, monospace; font-size: .85em;
+           background: var(--bg); padding: .1rem .3rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>dllm coordinator <span class="live" id="liveDot">live</span></h1>
+
+  <div class="grid">
+    <div class="card"><div class="label">round</div>
+      <div class="value" id="round">—</div>
+      <div class="sub" id="round_sub">—</div></div>
+    <div class="card"><div class="label">val loss</div>
+      <div class="value" id="val">—</div>
+      <div class="sub" id="val_sub">perplexity —</div></div>
+    <div class="card"><div class="label">cumulative FLOPs</div>
+      <div class="value" id="flops">—</div>
+      <div class="sub" id="flops_sub">— of 10²⁵ systemic-risk line</div></div>
+    <div class="card"><div class="label">workers</div>
+      <div class="value" id="workers">—</div>
+      <div class="sub" id="workers_sub">— registered</div></div>
+  </div>
+
+  <h2>val loss over rounds</h2>
+  <div class="chart-wrap"><svg id="chart" viewBox="0 0 1200 320" preserveAspectRatio="none"></svg></div>
+
+  <h2>current round</h2>
+  <div class="card">
+    <table>
+      <tr><th style="width:14rem">field</th><th>value</th></tr>
+      <tr><td>round open</td><td id="open">—</td></tr>
+      <tr><td>quorum</td><td id="quorum">—</td></tr>
+      <tr><td>timeout policy</td><td id="timeout">—</td></tr>
+    </table>
+  </div>
+
+  <h2>recent rounds (last 20)</h2>
+  <div class="card" style="padding:0">
+    <table>
+      <thead><tr><th>round</th><th>val loss</th><th>FLOPs total</th><th>at</th></tr></thead>
+      <tbody id="history"><tr><td colspan="4" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    Polls <code>/status</code> + <code>/history</code> every 5 s. Refresh-safe.
+    See <a href="https://github.com/individuum/dllm">individuum/dllm</a> · PLAN.md for context.
+  </div>
+
+<script>
+function fmtFlops(n) {
+  if (n == null) return "—";
+  if (n >= 1e18) return (n/1e18).toFixed(2) + " EFLOP";
+  if (n >= 1e15) return (n/1e15).toFixed(2) + " PFLOP";
+  if (n >= 1e12) return (n/1e12).toFixed(2) + " TFLOP";
+  if (n >= 1e9) return (n/1e9).toFixed(2) + " GFLOP";
+  return n.toExponential(2);
+}
+function fmtTime(ts) {
+  if (!ts) return "—";
+  return new Date(ts*1000).toLocaleTimeString();
+}
+function fmtSeconds(s) {
+  if (s == null) return "—";
+  if (s < 60) return s.toFixed(1) + "s";
+  if (s < 3600) return (s/60).toFixed(1) + "m";
+  return (s/3600).toFixed(1) + "h";
+}
+
+function drawChart(history) {
+  const svg = document.getElementById("chart");
+  const data = (history || []).filter(h => h.val_loss != null);
+  if (data.length < 2) {
+    svg.innerHTML = '<text x="600" y="160" text-anchor="middle" fill="#999" font-size="14">need ≥2 rounds with val_loss</text>';
+    return;
+  }
+  const w = 1200, h = 320, padL = 60, padR = 20, padT = 20, padB = 40;
+  const xs = data.map(d => d.round);
+  const ys = data.map(d => d.val_loss);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const xS = x => padL + (x - minX) / Math.max(1, maxX - minX) * (w - padL - padR);
+  const yS = y => padT + (1 - (y - minY) / Math.max(0.01, maxY - minY)) * (h - padT - padB);
+  const points = data.map(d => `${xS(d.round)},${yS(d.val_loss)}`).join(" ");
+  const gridY = [minY, (minY + maxY) / 2, maxY];
+  let html = "";
+  for (const v of gridY) {
+    const y = yS(v);
+    html += `<line x1="${padL}" x2="${w - padR}" y1="${y}" y2="${y}" stroke="#ccc" stroke-dasharray="2,3" stroke-width=".5"/>`;
+    html += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="#888">${v.toFixed(3)}</text>`;
+  }
+  html += `<text x="${padL}" y="${h - 10}" font-size="11" fill="#888">round ${minX}</text>`;
+  html += `<text x="${w - padR}" y="${h - 10}" text-anchor="end" font-size="11" fill="#888">round ${maxX}</text>`;
+  html += `<polyline points="${points}" fill="none" stroke="#2563eb" stroke-width="2"/>`;
+  const last = data[data.length - 1];
+  html += `<circle cx="${xS(last.round)}" cy="${yS(last.val_loss)}" r="4" fill="#2563eb"/>`;
+  html += `<text x="${xS(last.round) - 8}" y="${yS(last.val_loss) - 8}" text-anchor="end" font-size="12" font-weight="600" fill="#2563eb">${last.val_loss.toFixed(4)}</text>`;
+  svg.innerHTML = html;
+}
+
+let lastRound = -1, lastBumpAt = Date.now();
+async function refresh() {
+  try {
+    const [status, histResp] = await Promise.all([
+      fetch("/status").then(r => r.json()),
+      fetch("/history").then(r => r.json())
+    ]);
+    document.getElementById("round").textContent = status.current_round;
+    document.getElementById("round_sub").textContent =
+      status.round_open_seconds != null ? `open ${fmtSeconds(status.round_open_seconds)}` : "—";
+    document.getElementById("val").textContent =
+      status.last_val_loss != null ? status.last_val_loss.toFixed(4) : "—";
+    document.getElementById("val_sub").textContent =
+      status.last_val_loss != null ? "perplexity " + Math.exp(status.last_val_loss).toFixed(1) : "perplexity —";
+    document.getElementById("flops").textContent = fmtFlops(status.flops_total);
+    document.getElementById("flops_sub").textContent =
+      ((status.flops_total / 1e25) * 100).toFixed(4) + "% of 10²⁵ systemic-risk line";
+    document.getElementById("workers").textContent = `${status.n_submitted} / ${status.world_size_target ?? (status.n_submitted + status.waiting_for)}`;
+    document.getElementById("workers_sub").textContent = `${status.n_registered} registered · waiting for ${status.waiting_for}`;
+    document.getElementById("open").textContent =
+      `${fmtSeconds(status.round_open_seconds)} / timeout ${fmtSeconds(status.round_timeout_seconds)}`;
+    document.getElementById("quorum").textContent =
+      `${status.n_submitted} submitted · ${status.waiting_for} pending · min_workers=${status.min_workers}`;
+    document.getElementById("timeout").textContent =
+      `force-advance after ${fmtSeconds(status.round_timeout_seconds)} if ≥${status.min_workers} delta(s) in`;
+
+    // staleness signal
+    const now = Date.now();
+    if (status.current_round !== lastRound) { lastRound = status.current_round; lastBumpAt = now; }
+    document.body.classList.toggle("stale", (now - lastBumpAt) > 5 * 60 * 1000);
+
+    const hist = histResp.history || [];
+    drawChart(hist);
+    const rows = hist.slice(-20).reverse().map(r =>
+      `<tr><td>${r.round}</td><td>${r.val_loss != null ? r.val_loss.toFixed(4) : '—'}</td>` +
+      `<td>${fmtFlops(r.flops_total)}</td><td>${fmtTime(r.ts)}</td></tr>`).join("");
+    document.getElementById("history").innerHTML = rows || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">no outer steps yet</td></tr>';
+  } catch (e) {
+    document.getElementById("liveDot").textContent = "offline";
+    console.error(e);
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

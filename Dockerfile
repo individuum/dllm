@@ -24,7 +24,7 @@ CMD [ \
     "--host", "0.0.0.0", \
     "--port", "8000", \
     "--preset", "124M", \
-    "--world-size", "2", \
+    "--world-size", "1", \
     "--inner-steps", "500", \
     "--seq-len", "512", \
     "--micro-batch-size", "4", \
