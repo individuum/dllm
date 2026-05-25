@@ -59,6 +59,9 @@ class CoordinatorState:
         checkpoint_every: int = 10,
         resume: bool = True,
         require_signed_deltas: bool = False,
+        round_timeout_seconds: float = 900.0,
+        min_workers: int = 1,
+        enable_timeout_thread: bool = True,
     ) -> None:
         if preset_name not in PRESETS:
             raise ValueError(f"unknown preset {preset_name!r}; have {list(PRESETS)}")
@@ -72,6 +75,13 @@ class CoordinatorState:
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_every = checkpoint_every
         self.require_signed_deltas = require_signed_deltas
+        # Round-level timeout / min-quorum: if a round has been open >
+        # round_timeout_seconds and we have >= min_workers deltas, force the
+        # outer step with whoever submitted. Lets the cohort survive worker
+        # dropouts without operator intervention. Late deltas hit the
+        # resync path on the worker side.
+        self.round_timeout_seconds = max(0.0, round_timeout_seconds)
+        self.min_workers = max(1, min(min_workers, world_size))
 
         torch.manual_seed(train_cfg.seed)
         self.model = Transformer(self.cfg).to(self.device)
@@ -92,6 +102,16 @@ class CoordinatorState:
         self.flops_total: float = 0.0  # cumulative estimate
         self.round_started_at = time.time()
         self._state_bytes: bytes | None = None
+
+        self._timeout_stop = threading.Event()
+        self._timeout_thread: threading.Thread | None = None
+        if enable_timeout_thread and self.round_timeout_seconds > 0:
+            self._timeout_thread = threading.Thread(
+                target=self._timeout_loop,
+                daemon=True,
+                name="dllm-coord-timeout",
+            )
+            self._timeout_thread.start()
 
         if resume and self.checkpoint_dir is not None:
             latest = find_latest(self.checkpoint_dir)
@@ -120,6 +140,47 @@ class CoordinatorState:
 
     def _invalidate_state_cache(self) -> None:
         self._state_bytes = None
+
+    # -- timeout-based round eviction ----------------------------------------
+
+    def _timeout_loop(self) -> None:
+        """Background thread: poll for timed-out rounds and force-advance them."""
+        while not self._timeout_stop.wait(timeout=2.0):
+            try:
+                self._check_and_force_advance()
+            except Exception:  # noqa: BLE001
+                log.exception("timeout-thread error")
+
+    def _check_and_force_advance(self) -> bool:
+        """Idempotent. If round has been open > timeout AND >= min_workers have
+        submitted, run the outer step with what we have. Returns True on advance.
+        """
+        if self.round_timeout_seconds <= 0:
+            return False
+        with self.lock:
+            elapsed = time.time() - self.round_started_at
+            submitted = len(self.deltas.get(self.round, {}))
+            if elapsed < self.round_timeout_seconds:
+                return False
+            if submitted < self.min_workers:
+                return False  # too few deltas — keep waiting (e.g. all workers offline)
+            if submitted >= self.world_size:
+                return False  # the regular path will handle this on the submitting thread
+            log.warning(
+                "[TIMEOUT] forcing outer step at round=%d with %d/%d deltas after %.1fs (timeout=%.1fs, min_workers=%d)",
+                self.round,
+                submitted,
+                self.world_size,
+                elapsed,
+                self.round_timeout_seconds,
+                self.min_workers,
+            )
+            self._outer_step_locked()
+            return True
+
+    def stop(self) -> None:
+        """Signal the timeout thread to exit. Idempotent; thread is daemon anyway."""
+        self._timeout_stop.set()
 
     def _estimate_round_flops(self) -> float:
         """Crude FLOPs estimate: 6 * N_params * tokens_per_round * world_size.
@@ -193,6 +254,9 @@ class CoordinatorState:
                 waiting_for=max(0, self.world_size - n_sub),
                 last_val_loss=self.last_val_loss,
                 flops_total=self.flops_total,
+                round_open_seconds=time.time() - self.round_started_at,
+                round_timeout_seconds=self.round_timeout_seconds,
+                min_workers=self.min_workers,
             )
 
     def state_blob(self) -> tuple[bytes, int]:
@@ -396,6 +460,18 @@ def main() -> None:
         action="store_true",
         help="Reject /delta submissions without a valid Ed25519 signature (recommended)",
     )
+    ap.add_argument(
+        "--round-timeout-seconds",
+        type=float,
+        default=900.0,
+        help="Max wall-clock for a round; if exceeded with >= min-workers deltas, force-advance.",
+    )
+    ap.add_argument(
+        "--min-workers",
+        type=int,
+        default=1,
+        help="Minimum deltas needed for a timed-out round to advance (clamped to [1, world_size]).",
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -428,6 +504,8 @@ def main() -> None:
         checkpoint_every=args.checkpoint_every,
         resume=not args.no_resume,
         require_signed_deltas=args.require_signed_deltas,
+        round_timeout_seconds=args.round_timeout_seconds,
+        min_workers=args.min_workers,
     )
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

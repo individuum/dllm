@@ -29,9 +29,12 @@ class RoundStatus(BaseModel):
     current_round: int
     n_registered: int
     n_submitted: int
-    waiting_for: int  # n_registered - n_submitted
+    waiting_for: int  # world_size - n_submitted
     last_val_loss: float | None = None  # mean val loss across workers from the previous round
     flops_total: float = 0.0  # cumulative training FLOPs estimate
+    round_open_seconds: float = 0.0  # wall-clock the current round has been open
+    round_timeout_seconds: float = 0.0  # coord-configured eviction timeout (0 = disabled)
+    min_workers: int = 1  # min deltas needed to force-advance on timeout
 
 
 class DeltaAck(BaseModel):

@@ -29,7 +29,9 @@ CMD [ \
     "--seq-len", "512", \
     "--micro-batch-size", "4", \
     "--checkpoint-dir", "/data/checkpoints", \
-    "--checkpoint-every", "10", \
+    "--checkpoint-every", "3", \
     "--require-signed-deltas", \
+    "--round-timeout-seconds", "900", \
+    "--min-workers", "1", \
     "--device", "cpu" \
 ]
