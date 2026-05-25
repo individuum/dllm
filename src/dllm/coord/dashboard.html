@@ -72,9 +72,9 @@
     <div class="card"><div class="label">throughput</div>
       <div class="value" id="thru">—</div>
       <div class="sub" id="thru_sub">rolling 1h</div></div>
-    <div class="card"><div class="label">total elapsed</div>
+    <div class="card"><div class="label">active training time</div>
       <div class="value" id="elapsed">—</div>
-      <div class="sub" id="elapsed_sub">since round 0</div></div>
+      <div class="sub" id="elapsed_sub">excludes idle stalls (>10 min gaps)</div></div>
     <div class="card"><div class="label">best val loss</div>
       <div class="value" id="best">—</div>
       <div class="sub" id="best_sub">—</div></div>
@@ -137,42 +137,64 @@ function fmtClock(s) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
+// Round-to-round gaps larger than this are treated as idle (M5 stalled,
+// coord restart, blocked on quorum, etc.) and excluded from "active training".
+const STALL_THRESHOLD_S = 600;
+
 function computeMetrics(hist) {
-  // Returns derived stats: avg_round_seconds, last_hour_flops_per_sec,
-  // total_elapsed_seconds, best_val_loss, best_val_round.
   if (!hist || hist.length < 1) return {};
   const m = {};
-  // avg round time over last 10 rounds (need consecutive ts deltas)
-  const last10 = hist.slice(-11);  // 11 entries → 10 deltas
-  const deltas = [];
-  for (let i = 1; i < last10.length; i++) {
-    const dt = last10[i].ts - last10[i-1].ts;
-    const dr = last10[i].round - last10[i-1].round;
-    if (dt > 0 && dr > 0) deltas.push(dt / dr);  // seconds per round
+
+  // Per-round seconds + accumulators: "active" sums sane gaps, "idle" sums stalls.
+  // We also use this to compute avg_round_seconds from the last 10 active gaps.
+  const activeDeltas = [];
+  let activeSec = 0, idleSec = 0;
+  for (let i = 1; i < hist.length; i++) {
+    const dt = hist[i].ts - hist[i-1].ts;
+    const dr = hist[i].round - hist[i-1].round;
+    if (dt > 0 && dr > 0) {
+      const perRound = dt / dr;
+      if (perRound < STALL_THRESHOLD_S) {
+        activeDeltas.push(perRound);
+        activeSec += dt;
+      } else {
+        idleSec += dt;
+      }
+    }
   }
-  if (deltas.length > 0) {
-    m.avg_round_seconds = deltas.reduce((a,b) => a+b, 0) / deltas.length;
+  const last10 = activeDeltas.slice(-10);
+  if (last10.length > 0) {
+    m.avg_round_seconds = last10.reduce((a, b) => a + b, 0) / last10.length;
   }
-  // total elapsed from first → last
-  if (hist.length >= 2 && hist[0].ts > 0 && hist[hist.length-1].ts > 0) {
-    m.total_elapsed_seconds = hist[hist.length-1].ts - hist[0].ts;
+  m.active_training_seconds = activeSec;
+  m.idle_seconds = idleSec;
+
+  // wall clock from first → last (kept for the sub-line)
+  if (hist.length >= 2 && hist[0].ts > 0 && hist[hist.length - 1].ts > 0) {
+    m.wall_clock_seconds = hist[hist.length - 1].ts - hist[0].ts;
   }
+
   // throughput in last hour: FLOPs/sec
-  const now = hist[hist.length-1].ts;
+  const now = hist[hist.length - 1].ts;
   const cutoff = now - 3600;
   const recent = hist.filter(h => h.ts >= cutoff);
   if (recent.length >= 2) {
-    const dF = recent[recent.length-1].flops_total - recent[0].flops_total;
-    const dT = recent[recent.length-1].ts - recent[0].ts;
+    const dF = recent[recent.length - 1].flops_total - recent[0].flops_total;
+    const dT = recent[recent.length - 1].ts - recent[0].ts;
     if (dT > 0) m.recent_flops_per_sec = dF / dT;
   }
-  // best val loss
+
+  // best val loss + most recent non-null val_loss (used as fallback for the
+  // hero tile when the coord's last_val_loss is null right after a restart)
   const losses = hist.filter(h => h.val_loss != null);
   if (losses.length) {
     let bestRow = losses[0];
     for (const h of losses) if (h.val_loss < bestRow.val_loss) bestRow = h;
     m.best_val_loss = bestRow.val_loss;
     m.best_val_round = bestRow.round;
+    const lastRow = losses[losses.length - 1];
+    m.latest_val_loss = lastRow.val_loss;
+    m.latest_val_round = lastRow.round;
   }
   return m;
 }
@@ -218,10 +240,26 @@ async function refresh() {
     document.getElementById("round").textContent = status.current_round;
     document.getElementById("round_sub").textContent =
       status.round_open_seconds != null ? `open ${fmtSeconds(status.round_open_seconds)}` : "—";
+    // Fall back to most recent val_loss from history when status hasn't seen
+    // a fresh delta yet (typically right after a coord restart).
+    let _hist = (histResp.history || []);
+    let _displayVal = status.last_val_loss;
+    let _displaySource = "";
+    if (_displayVal == null) {
+      for (let i = _hist.length - 1; i >= 0; i--) {
+        if (_hist[i].val_loss != null) {
+          _displayVal = _hist[i].val_loss;
+          _displaySource = ` (round ${_hist[i].round})`;
+          break;
+        }
+      }
+    }
     document.getElementById("val").textContent =
-      status.last_val_loss != null ? status.last_val_loss.toFixed(4) : "—";
+      _displayVal != null ? _displayVal.toFixed(4) : "—";
     document.getElementById("val_sub").textContent =
-      status.last_val_loss != null ? "perplexity " + Math.exp(status.last_val_loss).toFixed(1) : "perplexity —";
+      _displayVal != null
+        ? "perplexity " + Math.exp(_displayVal).toFixed(1) + _displaySource
+        : "perplexity —";
     document.getElementById("flops").textContent = fmtFlops(status.flops_total);
     document.getElementById("flops_sub").textContent =
       ((status.flops_total / 1e25) * 100).toFixed(4) + "% of 10²⁵ systemic-risk line";
@@ -245,7 +283,7 @@ async function refresh() {
     if (status.current_round !== lastRound) { lastRound = status.current_round; lastBumpAt = now; }
     document.body.classList.toggle("stale", (now - lastBumpAt) > 5 * 60 * 1000);
 
-    const hist = histResp.history || [];
+    const hist = _hist;
     const m = computeMetrics(hist);
     document.getElementById("rtime").textContent = m.avg_round_seconds ? fmtClock(m.avg_round_seconds) : "—";
     document.getElementById("rtime_sub").textContent = m.avg_round_seconds
@@ -257,10 +295,15 @@ async function refresh() {
     document.getElementById("thru_sub").textContent = m.recent_flops_per_sec
       ? "rolling 1h · " + fmtFlops(m.recent_flops_per_sec * 3600) + "/h"
       : "need ≥2 rounds in last 1h";
-    document.getElementById("elapsed").textContent = fmtClock(m.total_elapsed_seconds);
-    document.getElementById("elapsed_sub").textContent = hist.length
-      ? `${hist.length} rounds recorded`
-      : "—";
+    document.getElementById("elapsed").textContent = fmtClock(m.active_training_seconds);
+    let elapsedSub = `${hist.length} rounds recorded`;
+    if (m.wall_clock_seconds) {
+      elapsedSub += ` · wall ${fmtClock(m.wall_clock_seconds)}`;
+    }
+    if (m.idle_seconds && m.idle_seconds > 60) {
+      elapsedSub += ` · idle ${fmtClock(m.idle_seconds)}`;
+    }
+    document.getElementById("elapsed_sub").textContent = elapsedSub;
     document.getElementById("best").textContent = m.best_val_loss != null
       ? m.best_val_loss.toFixed(4)
       : "—";
