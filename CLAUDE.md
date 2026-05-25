@@ -29,18 +29,15 @@ Run the worker:
     --max-rounds 200
 ```
 
-## Known issue: worker exits on stale-round rejection
+## Fixed: stale-round resync (was: worker exits on stale-round rejection)
 
-**Observed 2026-05-25 against the live coord.** M5 worker registered at round 9, ran 500 inner steps in ~5 min, but in that window the other two workers advanced the coord to round 12. The coord returned `{accepted: false, reason: 'stale: coord round=12, worker=9', next_round: 12}` and the worker's `_apply_sync_result` (worker.py:431-435) bails with `sync rejected` → `run()` logs `sync failed; stopping early` (worker.py:467-469) and exits 0.
+**Bug** (2026-05-25): M5 worker registered at round 9, ran 500 inner steps in ~5 min while the two faster 3060 workers advanced the coord to round 12. Coord returned `{accepted: false, reason: 'stale: coord round=12, worker=9', next_round: 12}` and the worker's `_apply_sync_result` bailed with `sync rejected`; `run()` logged `sync failed; stopping early` and exited 0. Val had dropped locally 7.06 → 6.70 before the bail, so inner work was real — the worker just couldn't keep up with the cadence and had no resync path.
 
-Val loss did drop locally (7.06 → 6.70 over one round) before the bail, so the inner loop is doing real work — the worker just can't keep up with the cadence and has no resync path.
+**Fix** (commit after `9c74ea6`): `_async_sync_io` now treats a stale-round rejection as a resync trigger — it fetches `/state` at the coord's current round and returns it with `resync=True`. `_apply_sync_result` then both updates `last_ref` and reloads the local model from the new consensus (preventing unbounded drift across many missed rounds). Optimizer state is preserved across the resync — matches DiLoCo paper guidance, the momentum is still useful gradient signal. Coverage in `tests/test_coord_api.py::test_worker_resync_on_stale_round_rejection`.
 
-**Suggested fix** (~10 lines in [src/dllm/client/worker.py](src/dllm/client/worker.py)): when `_async_sync_io` sees `accepted=false` with a `next_round`, GET `/state` at that round, return it as a "resync" result, and have `_apply_sync_result` update `last_ref` (and the local model + optimizer state? — needs design call) instead of returning False. Effectively: skip the missed deltas, catch up to the consensus, keep going. This makes the worker tolerant of being the slow node in a heterogeneous fleet — exactly the Phase 1+ scenario.
+Net effect: a slow worker (e.g. M5 in a 3060-dominated fleet) skips the missed outer steps, catches up to consensus, and keeps contributing — no longer exits 0 mid-run.
 
-Open questions for that PR:
-- Resync should probably also `load_into_model(self.model, new_state)` to avoid the local θ drifting arbitrarily far from consensus.
-- Should the rejected delta count toward FLOPs reporting? Currently `flops_total` is coord-side, so no — but worth confirming the coord doesn't double-bill on the retry.
-- Heterogeneous-fleet scheduling (PLAN.md §3 anchor pods vs individual workers) suggests tier-aware `inner_steps` per worker; the resync path is the bare-minimum stopgap until that lands.
+Future tier-aware work (PLAN.md §3): per-worker `inner_steps` so anchor pods do 500+ while individual slow workers do fewer, eliminating the need for resync in the steady state. The resync path is the stopgap until that lands.
 
 ## Pointers
 

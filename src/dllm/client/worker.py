@@ -400,6 +400,24 @@ class Worker:
         r.raise_for_status()
         ack = r.json()
         if not ack.get("accepted"):
+            # Stale-round rejection: in heterogeneous fleets, fast workers can
+            # advance the coord past where we submitted. Don't bail — fetch the
+            # current consensus state and re-align. The caller (_apply_sync_result)
+            # will reload the local model from this state, dropping the delta
+            # we just wasted but keeping the worker contributing.
+            next_r = ack.get("next_round")
+            if next_r is not None and next_r > round_no:
+                r2 = self.http.get("/state")
+                r2.raise_for_status()
+                codec = r2.headers.get("x-codec", self.state_codec)
+                new_state = deserialize_state(r2.content, codec=codec)  # type: ignore[arg-type]
+                return {
+                    "ack": ack,
+                    "state": new_state,
+                    "round": int(r2.headers["x-round"]),
+                    "state_bytes": len(r2.content),
+                    "resync": True,
+                }
             return {"ack": ack, "state": None, "round": round_no, "state_bytes": 0}
 
         target = ack.get("next_round")
@@ -425,19 +443,33 @@ class Worker:
         }
 
     def _apply_sync_result(self, result: dict) -> bool:
-        """Update last_ref to the new global. Returns True if a state was applied."""
+        """Update last_ref (always); on resync, also reload the local model to
+        avoid unbounded drift from old consensus. Returns True if applied.
+        """
         state = result.get("state")
         if state is None:
-            log.warning("sync rejected: %s", result.get("ack"))
+            log.warning("sync rejected without recoverable state: %s", result.get("ack"))
             return False
         with torch.no_grad():
             for n, ref_t in self.last_ref.items():
                 ref_t.copy_(state[n].to(ref_t.dtype).to(ref_t.device))
+        if result.get("resync"):
+            # We were stale; the next delta we send would otherwise encode
+            # several rounds of accumulated local drift from a no-longer-current
+            # consensus. Reload local θ from the current consensus so the next
+            # inner loop starts fresh.
+            load_into_model(self.model, state)
+            log.warning(
+                "RESYNC to round=%d (caught up from stale-round rejection); "
+                "local model reloaded from consensus",
+                result["round"],
+            )
         self.current_round = result["round"]
         log.info(
-            "async sync applied round=%d (%d state bytes)",
+            "async sync applied round=%d (%d state bytes)%s",
             self.current_round,
             result.get("state_bytes", 0),
+            " [resync]" if result.get("resync") else "",
         )
         return True
 

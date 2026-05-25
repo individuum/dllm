@@ -331,6 +331,97 @@ def test_signed_required_accepts_valid_signature(signed_state: CoordinatorState)
         Path("tests_tmp_key_b").unlink(missing_ok=True)
 
 
+def test_worker_resync_on_stale_round_rejection(tmp_path: Path) -> None:
+    """A slow worker whose delta arrives stale should resync to the latest
+    consensus instead of bailing — the M5/3060 heterogeneous-fleet scenario.
+    """
+    from pathlib import Path as P
+
+    from dllm.client.worker import Worker, pick_device
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_delta
+    from dllm.shared.serialize import (
+        compute_delta,
+        serialize_delta,
+        snapshot,
+        state_to_bytes,
+    )
+
+    # ws=1 coord so a single test client can drive a round advance directly
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+    )
+    client = TestClient(create_app(coord))
+
+    sk = load_or_create_identity(tmp_path / "id.key")
+
+    # register and pull initial state
+    rr = client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+    )
+    assert rr.status_code == 200
+    worker_id = rr.json()["worker_id"]
+    initial_round = rr.json()["current_round"]
+    assert initial_round == 0
+
+    # advance the coord directly to simulate other (fast) workers having moved on
+    for r in range(3):
+        snap = snapshot(coord.model)
+        with torch.no_grad():
+            for p in coord.model.parameters():
+                p.add_(torch.randn_like(p) * 0.001)
+        delta = compute_delta(snap, coord.model)
+        with torch.no_grad():
+            for n, p in coord.model.named_parameters():
+                p.copy_(snap[n])
+        blob = state_to_bytes(delta)
+        sig = sign_delta(sk, worker_id, r, blob)
+        ack = client.post(
+            "/delta",
+            params={"worker_id": worker_id, "round": r},
+            content=blob,
+            headers={
+                "content-type": "application/octet-stream",
+                "x-delta-signature": sig,
+            },
+        ).json()
+        assert ack["accepted"]
+
+    assert coord.round == 3
+
+    # Now simulate the slow worker submitting at the OLD round 0
+    stale_blob = state_to_bytes({
+        n: torch.zeros_like(p) for n, p in coord.model.named_parameters()
+    })
+    stale_sig = sign_delta(sk, worker_id, 0, stale_blob)
+    rej = client.post(
+        "/delta",
+        params={"worker_id": worker_id, "round": 0},
+        content=stale_blob,
+        headers={
+            "content-type": "application/octet-stream",
+            "x-delta-signature": stale_sig,
+        },
+    ).json()
+    assert rej["accepted"] is False
+    assert rej["next_round"] == 3
+    assert "stale" in rej["reason"]
+
+    # GET /state should give us the round-3 state — the resync path
+    sr = client.get("/state")
+    assert sr.status_code == 200
+    assert int(sr.headers["x-round"]) == 3
+
+
 def test_signed_required_rejects_other_workers_signature(signed_state: CoordinatorState) -> None:
     """Worker A registers, worker B signs A's delta with B's key — must reject."""
     from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_delta
