@@ -8,6 +8,7 @@ val-loss aggregation, and cumulative FLOPs accounting.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import threading
@@ -92,7 +93,12 @@ class CoordinatorState:
         self.min_workers = max(1, min(min_workers, world_size))
         # Ring buffer of (round, val_loss, flops_total, ts) appended at each
         # outer step. Powers the dashboard chart at GET /.
+        # Persisted to <checkpoint_dir>/history.jsonl (append-only NDJSON)
+        # so the chart survives coord restarts.
         self.history: deque[dict] = deque(maxlen=500)
+        self._history_path: Path | None = (
+            self.checkpoint_dir / "history.jsonl" if self.checkpoint_dir else None
+        )
 
         torch.manual_seed(train_cfg.seed)
         self.model = Transformer(self.cfg).to(self.device)
@@ -134,13 +140,16 @@ class CoordinatorState:
                     self.deltas = {self.round: {}}
                     self.val_losses = {self.round: []}
                     log.info("resumed from %s -> starting at round %d", latest, self.round)
-                except (KeyError, ValueError, RuntimeError) as e:
+                except (KeyError, ValueError, RuntimeError, OSError) as e:
                     log.warning(
-                        "checkpoint %s incompatible with current preset (%s); "
+                        "checkpoint %s incompatible or unreadable (%s); "
                         "starting fresh at round 0",
                         latest,
                         e,
                     )
+            # Always try to populate history, even if no compatible checkpoint
+            self._load_history_from_disk()
+            self._backfill_history_from_checkpoint_metas()
 
     # -- helpers --------------------------------------------------------------
 
@@ -151,6 +160,85 @@ class CoordinatorState:
 
     def _invalidate_state_cache(self) -> None:
         self._state_bytes = None
+
+    # -- history persistence ---------------------------------------------------
+
+    def _append_history(self, entry: dict) -> None:
+        """Append to the in-memory deque AND the on-disk NDJSON log."""
+        self.history.append(entry)
+        if self._history_path is not None:
+            try:
+                self._history_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._history_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+            except OSError as e:
+                log.warning("could not persist history entry: %s", e)
+
+    def _load_history_from_disk(self) -> None:
+        """Load history.jsonl into the deque on startup (caps at maxlen)."""
+        if self._history_path is None or not self._history_path.exists():
+            return
+        entries: list[dict] = []
+        try:
+            with self._history_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue  # tolerate partial last write
+        except OSError as e:
+            log.warning("could not load history.jsonl: %s", e)
+            return
+        # Deque maxlen drops oldest automatically
+        for entry in entries[-self.history.maxlen :]:
+            self.history.append(entry)
+        log.info("loaded %d history entries from %s", len(self.history), self._history_path)
+
+    def _backfill_history_from_checkpoint_metas(self) -> None:
+        """Reconstruct sparse history from each ckpt_*/meta.json (one per
+        checkpoint-every rounds). First-time enable: fills in everything that
+        happened before history persistence existed.
+        """
+        if self.checkpoint_dir is None or not self.checkpoint_dir.exists():
+            return
+        existing_rounds = {h.get("round") for h in self.history}
+        added = 0
+        for ckpt_dir in sorted(self.checkpoint_dir.iterdir()):
+            if not ckpt_dir.is_dir() or not ckpt_dir.name.startswith("ckpt_"):
+                continue
+            meta_file = ckpt_dir / "meta.json"
+            if not meta_file.exists():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            round_no = meta.get("round")
+            if round_no in existing_rounds:
+                continue
+            self.history.append(
+                {
+                    "round": round_no,
+                    "val_loss": meta.get("last_val_loss"),
+                    "flops_total": float(meta.get("flops_total", 0.0)),
+                    "ts": float(meta.get("ts", 0.0)),
+                }
+            )
+            existing_rounds.add(round_no)
+            added += 1
+        if added:
+            # Re-sort by round so the chart draws cleanly
+            sorted_hist = sorted(self.history, key=lambda h: (h.get("round") or 0))
+            self.history.clear()
+            self.history.extend(sorted_hist)
+            log.info(
+                "backfilled %d history entries from %d checkpoint meta files",
+                added,
+                added,
+            )
 
     # -- timeout-based round eviction ----------------------------------------
 
@@ -355,8 +443,8 @@ class CoordinatorState:
         self.round_started_at = time.time()
         self._invalidate_state_cache()
 
-        # record for the dashboard's loss-curve chart
-        self.history.append(
+        # record for the dashboard's loss-curve chart (persisted to disk)
+        self._append_history(
             {
                 "round": prev_round,
                 "val_loss": self.last_val_loss,

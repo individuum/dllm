@@ -104,3 +104,97 @@ def test_history_caps_at_maxlen(state: CoordinatorState) -> None:
     from collections import deque
     assert isinstance(state.history, deque)
     assert state.history.maxlen == 500
+
+
+def test_history_persists_to_disk_and_reloads(tmp_path: Path) -> None:
+    """A round's history entry survives a CoordinatorState restart via
+    history.jsonl in the checkpoint dir.
+    """
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    ckpt = tmp_path / "ckpts"
+    ckpt.mkdir()
+
+    s1 = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=ckpt,
+        enable_timeout_thread=False,
+    )
+    sk = load_or_create_identity(tmp_path / "id.key")
+    client1 = TestClient(create_app(s1))
+    client1.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+    )
+    snap = snapshot(s1.model)
+    with torch.no_grad():
+        for p in s1.model.parameters():
+            p.add_(torch.randn_like(p) * 0.001)
+    delta = compute_delta(snap, s1.model)
+    with torch.no_grad():
+        for n, p in s1.model.named_parameters():
+            p.copy_(snap[n])
+    blob = state_to_bytes(delta)
+    sig = sign_delta(sk, 0, 0, blob)
+    client1.post(
+        "/delta",
+        params={"worker_id": 0, "round": 0, "val_loss": 4.2},
+        content=blob,
+        headers={"content-type": "application/octet-stream", "x-delta-signature": sig},
+    )
+    assert len(s1.history) == 1
+    assert (ckpt / "history.jsonl").exists()
+
+    # Restart simulation: new state, same checkpoint_dir
+    s2 = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=ckpt,
+        enable_timeout_thread=False,
+    )
+    assert len(s2.history) == 1
+    assert s2.history[0]["round"] == 0
+    assert s2.history[0]["val_loss"] == pytest.approx(4.2)
+
+
+def test_backfill_reads_checkpoint_metas(tmp_path: Path) -> None:
+    """Old checkpoints without a history.jsonl get backfilled from their meta.json."""
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    ckpt = tmp_path / "ckpts"
+    ckpt.mkdir()
+    # Fake some past checkpoints as if from before history existed
+    import json as _json
+    for r in (2, 5, 8):
+        d = ckpt / f"ckpt_{r:06d}"
+        d.mkdir()
+        (d / "meta.json").write_text(
+            _json.dumps({"round": r, "ts": 1000.0 + r, "flops_total": 1e15 * r, "last_val_loss": 7.0 - r * 0.3})
+        )
+        # bare-minimum dummy files so find_latest doesn't trip; full load
+        # would need real safetensors but backfill doesn't care
+    s = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=ckpt,
+        enable_timeout_thread=False,
+    )
+    rounds = [h["round"] for h in s.history]
+    assert rounds == [2, 5, 8]
+    assert s.history[1]["val_loss"] == pytest.approx(7.0 - 5 * 0.3)
+    assert s.history[2]["flops_total"] == pytest.approx(1e15 * 8)
