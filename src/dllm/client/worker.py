@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -176,6 +177,65 @@ def _sync_device(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
+# Transient network/transport failures that should be retried. Truncated bodies
+# (RemoteProtocolError) are common when pulling the ~200 MB /state blob over a
+# long-haul link — nginx, podman or the TLS termination can drop mid-stream
+# and the worker used to crash with no recovery.
+_RETRY_HTTPX_EXC: tuple[type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+
+def retry_http(
+    fn: Callable[[], httpx.Response],
+    *,
+    label: str,
+    max_attempts: int = 4,
+    base_delay: float = 1.0,
+) -> httpx.Response:
+    """Call ``fn`` with retry + exponential backoff on transient errors and 5xx.
+
+    Retries: connection drops, truncated bodies, timeouts, and HTTP 5xx.
+    Passes through (no retry): 4xx responses — the coord is telling us
+    something the client must handle (e.g. 404 = deregistered, 409 = stale).
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = fn()
+        except _RETRY_HTTPX_EXC as e:
+            last_exc = e
+            if attempt == max_attempts:
+                log.error(
+                    "[HTTP] %s failed after %d attempts: %s", label, attempt, e
+                )
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            log.warning(
+                "[HTTP] %s transient error (attempt %d/%d): %s; retrying in %.1fs",
+                label, attempt, max_attempts, e, delay,
+            )
+            time.sleep(delay)
+            continue
+        if 500 <= r.status_code < 600 and attempt < max_attempts:
+            delay = base_delay * (2 ** (attempt - 1))
+            log.warning(
+                "[HTTP] %s got %d (attempt %d/%d); retrying in %.1fs",
+                label, r.status_code, attempt, max_attempts, delay,
+            )
+            time.sleep(delay)
+            continue
+        return r
+    raise RuntimeError(f"{label} retry loop exhausted") from last_exc
+
+
 class Worker:
     def __init__(
         self,
@@ -318,7 +378,7 @@ class Worker:
             )
 
     def pull_state(self) -> int:
-        r = self.http.get("/state")
+        r = retry_http(lambda: self.http.get("/state"), label="GET /state (initial)")
         r.raise_for_status()
         round_no = int(r.headers["x-round"])
         codec = r.headers.get("x-codec", self.state_codec)
@@ -477,15 +537,27 @@ class Worker:
         params: dict = {"worker_id": self.worker_id, "round": round_no}
         if val_loss is not None:
             params["val_loss"] = val_loss
-        r = self.http.post(
-            "/delta",
-            params=params,
-            content=blob,
-            headers={
-                "content-type": "application/octet-stream",
-                "x-delta-signature": sig,
-            },
+        r = retry_http(
+            lambda: self.http.post(
+                "/delta",
+                params=params,
+                content=blob,
+                headers={
+                    "content-type": "application/octet-stream",
+                    "x-delta-signature": sig,
+                },
+            ),
+            label="POST /delta",
         )
+        if r.status_code == 404:
+            # Coord no longer recognizes this worker — it timed us out for
+            # inactivity. Signal a clean stop instead of crashing; caller can
+            # decide whether to re-register (future work).
+            log.error(
+                "POST /delta -> 404; coord deregistered worker_id=%s. Stopping.",
+                self.worker_id,
+            )
+            return {"ack": None, "state": None, "round": round_no, "state_bytes": 0, "dropped": True}
         r.raise_for_status()
         ack = r.json()
         if not ack.get("accepted"):
@@ -496,7 +568,9 @@ class Worker:
             # we just wasted but keeping the worker contributing.
             next_r = ack.get("next_round")
             if next_r is not None and next_r > round_no:
-                r2 = self.http.get("/state")
+                r2 = retry_http(
+                    lambda: self.http.get("/state"), label="GET /state (resync)"
+                )
                 r2.raise_for_status()
                 codec = r2.headers.get("x-codec", self.state_codec)
                 new_state = deserialize_state(r2.content, codec=codec)  # type: ignore[arg-type]
@@ -513,14 +587,18 @@ class Worker:
         if target is None:
             # other workers haven't submitted yet — long-poll status
             while True:
-                rs = self.http.get("/status")
+                rs = retry_http(
+                    lambda: self.http.get("/status"), label="GET /status (poll)"
+                )
                 rs.raise_for_status()
                 cur = rs.json()["current_round"]
                 if cur > round_no:
                     break
                 time.sleep(0.5)
 
-        r2 = self.http.get("/state")
+        r2 = retry_http(
+            lambda: self.http.get("/state"), label="GET /state (post-accept)"
+        )
         r2.raise_for_status()
         codec = r2.headers.get("x-codec", self.state_codec)
         new_state = deserialize_state(r2.content, codec=codec)  # type: ignore[arg-type]
