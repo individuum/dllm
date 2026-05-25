@@ -65,6 +65,21 @@
       <div class="sub" id="workers_sub">— this round</div></div>
   </div>
 
+  <div class="grid" style="margin-top:1rem">
+    <div class="card"><div class="label">avg round time (last 10)</div>
+      <div class="value" id="rtime">—</div>
+      <div class="sub" id="rtime_sub">—</div></div>
+    <div class="card"><div class="label">throughput</div>
+      <div class="value" id="thru">—</div>
+      <div class="sub" id="thru_sub">rolling 1h</div></div>
+    <div class="card"><div class="label">total elapsed</div>
+      <div class="value" id="elapsed">—</div>
+      <div class="sub" id="elapsed_sub">since round 0</div></div>
+    <div class="card"><div class="label">best val loss</div>
+      <div class="value" id="best">—</div>
+      <div class="sub" id="best_sub">—</div></div>
+  </div>
+
   <h2>val loss over rounds</h2>
   <div class="chart-wrap"><svg id="chart" viewBox="0 0 1200 320" preserveAspectRatio="none"></svg></div>
 
@@ -109,6 +124,57 @@ function fmtSeconds(s) {
   if (s < 60) return s.toFixed(1) + "s";
   if (s < 3600) return (s/60).toFixed(1) + "m";
   return (s/3600).toFixed(1) + "h";
+}
+function fmtClock(s) {
+  // "1m 42s", "2h 13m", "23m"
+  if (s == null || s < 0) return "—";
+  if (s < 60) return Math.round(s) + "s";
+  if (s < 3600) {
+    const m = Math.floor(s/60), sec = Math.round(s - m*60);
+    return sec ? `${m}m ${sec}s` : `${m}m`;
+  }
+  const h = Math.floor(s/3600), m = Math.round((s - h*3600)/60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+function computeMetrics(hist) {
+  // Returns derived stats: avg_round_seconds, last_hour_flops_per_sec,
+  // total_elapsed_seconds, best_val_loss, best_val_round.
+  if (!hist || hist.length < 1) return {};
+  const m = {};
+  // avg round time over last 10 rounds (need consecutive ts deltas)
+  const last10 = hist.slice(-11);  // 11 entries → 10 deltas
+  const deltas = [];
+  for (let i = 1; i < last10.length; i++) {
+    const dt = last10[i].ts - last10[i-1].ts;
+    const dr = last10[i].round - last10[i-1].round;
+    if (dt > 0 && dr > 0) deltas.push(dt / dr);  // seconds per round
+  }
+  if (deltas.length > 0) {
+    m.avg_round_seconds = deltas.reduce((a,b) => a+b, 0) / deltas.length;
+  }
+  // total elapsed from first → last
+  if (hist.length >= 2 && hist[0].ts > 0 && hist[hist.length-1].ts > 0) {
+    m.total_elapsed_seconds = hist[hist.length-1].ts - hist[0].ts;
+  }
+  // throughput in last hour: FLOPs/sec
+  const now = hist[hist.length-1].ts;
+  const cutoff = now - 3600;
+  const recent = hist.filter(h => h.ts >= cutoff);
+  if (recent.length >= 2) {
+    const dF = recent[recent.length-1].flops_total - recent[0].flops_total;
+    const dT = recent[recent.length-1].ts - recent[0].ts;
+    if (dT > 0) m.recent_flops_per_sec = dF / dT;
+  }
+  // best val loss
+  const losses = hist.filter(h => h.val_loss != null);
+  if (losses.length) {
+    let bestRow = losses[0];
+    for (const h of losses) if (h.val_loss < bestRow.val_loss) bestRow = h;
+    m.best_val_loss = bestRow.val_loss;
+    m.best_val_round = bestRow.round;
+  }
+  return m;
 }
 
 function drawChart(history) {
@@ -180,6 +246,28 @@ async function refresh() {
     document.body.classList.toggle("stale", (now - lastBumpAt) > 5 * 60 * 1000);
 
     const hist = histResp.history || [];
+    const m = computeMetrics(hist);
+    document.getElementById("rtime").textContent = m.avg_round_seconds ? fmtClock(m.avg_round_seconds) : "—";
+    document.getElementById("rtime_sub").textContent = m.avg_round_seconds
+      ? `${(60 / (m.avg_round_seconds / 60)).toFixed(1)} rounds/hour`
+      : "need ≥2 rounds";
+    document.getElementById("thru").textContent = m.recent_flops_per_sec
+      ? fmtFlops(m.recent_flops_per_sec) + "/s"
+      : "—";
+    document.getElementById("thru_sub").textContent = m.recent_flops_per_sec
+      ? "rolling 1h · " + fmtFlops(m.recent_flops_per_sec * 3600) + "/h"
+      : "need ≥2 rounds in last 1h";
+    document.getElementById("elapsed").textContent = fmtClock(m.total_elapsed_seconds);
+    document.getElementById("elapsed_sub").textContent = hist.length
+      ? `${hist.length} rounds recorded`
+      : "—";
+    document.getElementById("best").textContent = m.best_val_loss != null
+      ? m.best_val_loss.toFixed(4)
+      : "—";
+    document.getElementById("best_sub").textContent = m.best_val_loss != null
+      ? `at round ${m.best_val_round} · ppl ${Math.exp(m.best_val_loss).toFixed(1)}`
+      : "—";
+
     drawChart(hist);
     const rows = hist.slice(-20).reverse().map(r =>
       `<tr><td>${r.round}</td><td>${r.val_loss != null ? r.val_loss.toFixed(4) : '—'}</td>` +
