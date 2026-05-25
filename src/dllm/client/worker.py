@@ -38,6 +38,7 @@ from ..shared.serialize import (
     serialize_delta,
     snapshot,
 )
+from .power import PowerMeter
 
 log = logging.getLogger("dllm.worker")
 
@@ -249,6 +250,7 @@ class Worker:
         val_batches: int = 8,
         auto_tune_steps: bool = False,
         target_round_seconds: float = 90.0,
+        estimated_watts: float | None = None,
     ) -> None:
         self.coord_url = coord_url.rstrip("/")
         self.preset = preset
@@ -263,6 +265,7 @@ class Worker:
         self.val_batches = val_batches
         self.auto_tune_steps = auto_tune_steps
         self.target_round_seconds = target_round_seconds
+        self.power_meter = PowerMeter(device, override_watts=estimated_watts)
 
         # Ed25519 identity — persisted in .dllm/identity.key
         self.sk = load_or_create_identity()
@@ -307,6 +310,12 @@ class Worker:
         # consensus. See arXiv:2401.09135.
         self.last_ref: dict[str, torch.Tensor] = {}
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dllm-sync")
+
+        # Per-inner-loop telemetry, set inside run_inner() and shipped to the
+        # coord on the next /delta. Used by the dashboard's energy + throughput
+        # series.
+        self.last_inner_power_watts: float | None = None
+        self.last_inner_tok_per_s: float | None = None
 
     # -- registration & state sync -------------------------------------------
 
@@ -409,9 +418,14 @@ class Worker:
             else _nullcontext()
         )
 
+        # Power samples. Read every ~max(1, inner_steps // 32) steps so we get
+        # at least one reading on tiny inner loops and don't burn CPU on big ones.
+        power_samples: list[float] = []
+        sample_every = max(1, self.inner_steps // 32)
+
         loss_sum = 0.0
         t0 = time.time()
-        for _ in range(self.inner_steps):
+        for step_i in range(self.inner_steps):
             x, y = self.train_loader.next_batch()
             with autocast_ctx:
                 _, loss = self.model(x, y)
@@ -420,39 +434,54 @@ class Worker:
             self.opt.step()
             self.opt.zero_grad(set_to_none=True)
             loss_sum += float(loss.detach().item())
+            if step_i % sample_every == 0:
+                w = self.power_meter.sample()
+                if w is not None:
+                    power_samples.append(w)
 
         avg_loss = loss_sum / max(1, self.inner_steps)
         dt = time.time() - t0
         tok_per_s = self.inner_steps * self.micro_batch_size * self.seq_len / dt
+        avg_power = (sum(power_samples) / len(power_samples)) if power_samples else None
+
+        # Side-channel: read by run() right before /delta is submitted.
+        self.last_inner_tok_per_s = tok_per_s
+        self.last_inner_power_watts = avg_power
+
+        power_msg = f" power={avg_power:.0f}W" if avg_power is not None else ""
+
         if self.device.type == "cuda":
             peak_mib = torch.cuda.max_memory_allocated(self.device) / (1024**2)
             log.info(
-                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s peak_vram=%.1f MiB",
+                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s peak_vram=%.1f MiB%s",
                 self.current_round,
                 avg_loss,
                 self.inner_steps,
                 tok_per_s,
                 peak_mib,
+                power_msg,
             )
             torch.cuda.reset_peak_memory_stats(self.device)
         elif self.device.type == "mps":
             # MPS reports current rather than peak; close enough at end-of-loop
             mem_mib = torch.mps.current_allocated_memory() / (1024**2)
             log.info(
-                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s mem=%.1f MiB (MPS)",
+                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s mem=%.1f MiB (MPS)%s",
                 self.current_round,
                 avg_loss,
                 self.inner_steps,
                 tok_per_s,
                 mem_mib,
+                power_msg,
             )
         else:
             log.info(
-                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s (CPU)",
+                "inner round=%d avg_loss=%.4f steps=%d %.0f tok/s (CPU)%s",
                 self.current_round,
                 avg_loss,
                 self.inner_steps,
                 tok_per_s,
+                power_msg,
             )
 
         return compute_delta(snap, self.model)
@@ -530,13 +559,22 @@ class Worker:
     # -- async sync (background thread) --------------------------------------
 
     def _async_sync_io(
-        self, blob: bytes, val_loss: float | None, round_no: int
+        self,
+        blob: bytes,
+        val_loss: float | None,
+        round_no: int,
+        power_watts: float | None = None,
+        tokens_per_sec: float | None = None,
     ) -> dict:
         """Background: sign, POST /delta, wait for round advance, GET /state."""
         sig = sign_delta(self.sk, self.worker_id, round_no, blob)
         params: dict = {"worker_id": self.worker_id, "round": round_no}
         if val_loss is not None:
             params["val_loss"] = val_loss
+        if power_watts is not None:
+            params["power_watts"] = power_watts
+        if tokens_per_sec is not None:
+            params["tokens_per_sec"] = tokens_per_sec
         r = retry_http(
             lambda: self.http.post(
                 "/delta",
@@ -695,7 +733,12 @@ class Worker:
 
                 # kick off async sync — next inner loop runs in parallel
                 pending = self._exec.submit(
-                    self._async_sync_io, blob, val_loss, self.current_round
+                    self._async_sync_io,
+                    blob,
+                    val_loss,
+                    self.current_round,
+                    self.last_inner_power_watts,
+                    self.last_inner_tok_per_s,
                 )
 
             # drain any in-flight sync
@@ -705,6 +748,7 @@ class Worker:
                     rounds_committed += 1
         finally:
             self._exec.shutdown(wait=False)
+            self.power_meter.close()
 
 
 def main() -> None:
@@ -734,6 +778,16 @@ def main() -> None:
         "--require-gpu",
         action="store_true",
         help="Fail fast if no CUDA/MPS available instead of silently falling back to CPU",
+    )
+    ap.add_argument(
+        "--estimated-watts",
+        type=float,
+        default=None,
+        help=(
+            "Override the auto-detected power reading with this constant (W). "
+            "Use when NVML isn't available or to model a known device exactly. "
+            "Default: NVML on CUDA if installed; VRAM-tier / TDP estimate otherwise."
+        ),
     )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
@@ -765,6 +819,7 @@ def main() -> None:
         val_batches=args.val_batches,
         auto_tune_steps=args.auto_tune_steps,
         target_round_seconds=args.target_round_seconds,
+        estimated_watts=args.estimated_watts,
     )
     w.run(max_rounds=args.max_rounds)
 

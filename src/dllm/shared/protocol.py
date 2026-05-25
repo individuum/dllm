@@ -35,6 +35,11 @@ class RoundStatus(BaseModel):
     round_open_seconds: float = 0.0  # wall-clock the current round has been open
     round_timeout_seconds: float = 0.0  # coord-configured eviction timeout (0 = disabled)
     min_workers: int = 1  # min deltas needed to force-advance on timeout
+    # Energy / cohort throughput. Both populated as soon as workers start
+    # reporting power_watts + tokens_per_sec on /delta.
+    energy_wh_total: float = 0.0  # cumulative Wh used by the cohort
+    last_power_watts: float | None = None  # mean cohort draw during previous round
+    last_tokens_per_sec: float | None = None  # summed cohort throughput, previous round
 
 
 class DeltaAck(BaseModel):

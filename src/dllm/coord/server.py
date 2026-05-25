@@ -115,8 +115,13 @@ class CoordinatorState:
         self.workers: dict[int, dict[str, Any]] = {}
         self.deltas: dict[int, dict[int, dict[str, torch.Tensor]]] = {0: {}}
         self.val_losses: dict[int, list[float]] = {0: []}
+        self.power_watts_per_round: dict[int, list[float]] = {0: []}
+        self.tokens_per_sec_per_round: dict[int, list[float]] = {0: []}
         self.last_val_loss: float | None = None
+        self.last_power_watts: float | None = None  # mean of last round's workers
+        self.last_tokens_per_sec: float | None = None  # sum across last round's workers
         self.flops_total: float = 0.0  # cumulative estimate
+        self.energy_wh_total: float = 0.0  # cumulative cohort energy
         self.round_started_at = time.time()
         self._state_bytes: bytes | None = None
 
@@ -137,8 +142,11 @@ class CoordinatorState:
                     meta = load_checkpoint(latest, self.model, self.outer_opt)
                     self.round = int(meta.get("round", 0)) + 1
                     self.flops_total = float(meta.get("flops_total", 0.0))
+                    self.energy_wh_total = float(meta.get("energy_wh_total", 0.0))
                     self.deltas = {self.round: {}}
                     self.val_losses = {self.round: []}
+                    self.power_watts_per_round = {self.round: []}
+                    self.tokens_per_sec_per_round = {self.round: []}
                     log.info("resumed from %s -> starting at round %d", latest, self.round)
                 except (KeyError, ValueError, RuntimeError, OSError) as e:
                     log.warning(
@@ -150,6 +158,18 @@ class CoordinatorState:
             # Always try to populate history, even if no compatible checkpoint
             self._load_history_from_disk()
             self._backfill_history_from_checkpoint_metas()
+            # Recover cumulative energy from history if we didn't resume from
+            # a checkpoint (or if the checkpoint predates the energy field).
+            if self.energy_wh_total == 0.0 and self.history:
+                for entry in reversed(self.history):
+                    e = entry.get("energy_wh_total")
+                    if e:
+                        self.energy_wh_total = float(e)
+                        log.info(
+                            "recovered cumulative energy_wh_total=%.2f from history",
+                            self.energy_wh_total,
+                        )
+                        break
 
     # -- helpers --------------------------------------------------------------
 
@@ -356,6 +376,9 @@ class CoordinatorState:
                 round_open_seconds=time.time() - self.round_started_at,
                 round_timeout_seconds=self.round_timeout_seconds,
                 min_workers=self.min_workers,
+                energy_wh_total=self.energy_wh_total,
+                last_power_watts=self.last_power_watts,
+                last_tokens_per_sec=self.last_tokens_per_sec,
             )
 
     def state_blob(self) -> tuple[bytes, int]:
@@ -368,6 +391,8 @@ class CoordinatorState:
         claimed_round: int,
         blob: bytes,
         val_loss: float | None = None,
+        power_watts: float | None = None,
+        tokens_per_sec: float | None = None,
         signature_b64: str | None = None,
     ) -> DeltaAck:
         with self.lock:
@@ -396,13 +421,18 @@ class CoordinatorState:
             self.deltas[self.round][worker_id] = delta
             if val_loss is not None:
                 self.val_losses[self.round].append(val_loss)
+            if power_watts is not None and power_watts > 0:
+                self.power_watts_per_round.setdefault(self.round, []).append(power_watts)
+            if tokens_per_sec is not None and tokens_per_sec > 0:
+                self.tokens_per_sec_per_round.setdefault(self.round, []).append(tokens_per_sec)
             log.info(
-                "delta round=%d worker=%d (%d/%d)%s",
+                "delta round=%d worker=%d (%d/%d)%s%s",
                 self.round,
                 worker_id,
                 len(self.deltas[self.round]),
                 self.world_size,
                 f" val_loss={val_loss:.4f}" if val_loss is not None else "",
+                f" power={power_watts:.0f}W" if power_watts is not None else "",
             )
             ready = len(self.deltas[self.round]) >= self.world_size
             if ready:
@@ -434,32 +464,65 @@ class CoordinatorState:
             )
         self.flops_total += self._estimate_round_flops()
 
+        # Cohort power + throughput aggregation. Mean across workers (best
+        # signal of "what one machine in the cohort is drawing"); total tokens/s
+        # is a sum (cohort-wide throughput).
+        round_powers = self.power_watts_per_round.get(self.round, [])
+        round_tok_s = self.tokens_per_sec_per_round.get(self.round, [])
+        mean_power = (sum(round_powers) / len(round_powers)) if round_powers else None
+        total_tok_s = sum(round_tok_s) if round_tok_s else None
+
+        # Energy = power * time. Use mean cohort power × world_size as a
+        # proxy for "total cohort wattage", multiplied by the actual round
+        # duration. (Real per-worker integration would need timestamped samples.)
+        round_seconds = max(0.0, time.time() - self.round_started_at)
+        if mean_power is not None and round_seconds > 0:
+            # Scale by number of workers that actually reported so we don't
+            # double-count when world_size > submitting workers.
+            n_reporting = len(round_powers)
+            cohort_watts = mean_power * n_reporting
+            self.energy_wh_total += cohort_watts * (round_seconds / 3600.0)
+
+        self.last_power_watts = mean_power
+        self.last_tokens_per_sec = total_tok_s
+
         prev_round = self.round
         self.round += 1
         self.deltas[self.round] = {}
         self.val_losses[self.round] = []
+        self.power_watts_per_round[self.round] = []
+        self.tokens_per_sec_per_round[self.round] = []
         del self.deltas[prev_round]
         del self.val_losses[prev_round]
+        self.power_watts_per_round.pop(prev_round, None)
+        self.tokens_per_sec_per_round.pop(prev_round, None)
         self.round_started_at = time.time()
         self._invalidate_state_cache()
 
-        # record for the dashboard's loss-curve chart (persisted to disk)
+        # record for the dashboard's chart (persisted to disk)
         self._append_history(
             {
                 "round": prev_round,
                 "val_loss": self.last_val_loss,
                 "flops_total": self.flops_total,
                 "ts": time.time(),
+                "round_seconds": round_seconds,
+                "power_watts": mean_power,
+                "tokens_per_sec": total_tok_s,
+                "energy_wh_total": self.energy_wh_total,
+                "n_workers": len(round_deltas),
             }
         )
 
         log.info(
-            "outer step %d -> %d (avg delta norm: %.4f, FLOPs ~%.2e, last_val_loss=%s)",
+            "outer step %d -> %d (avg delta norm: %.4f, FLOPs ~%.2e, last_val_loss=%s%s%s)",
             prev_round,
             self.round,
             _flat_norm(avg),
             self.flops_total,
             f"{self.last_val_loss:.4f}" if self.last_val_loss is not None else "n/a",
+            f", power={mean_power:.0f}W" if mean_power is not None else "",
+            f", energy_total={self.energy_wh_total:.1f}Wh" if self.energy_wh_total > 0 else "",
         )
 
         if (
@@ -477,6 +540,7 @@ class CoordinatorState:
                     "world_size": self.world_size,
                     "flops_total": self.flops_total,
                     "last_val_loss": self.last_val_loss,
+                    "energy_wh_total": self.energy_wh_total,
                 },
             )
 
@@ -542,11 +606,19 @@ def create_app(state: CoordinatorState) -> FastAPI:
         worker_id: int,
         round: int,
         val_loss: float | None = None,
+        power_watts: float | None = None,
+        tokens_per_sec: float | None = None,
     ):
         body = await request.body()
         sig = request.headers.get("x-delta-signature")
         ack = state.submit_delta(
-            worker_id, round, body, val_loss=val_loss, signature_b64=sig
+            worker_id,
+            round,
+            body,
+            val_loss=val_loss,
+            power_watts=power_watts,
+            tokens_per_sec=tokens_per_sec,
+            signature_b64=sig,
         )
         return JSONResponse(ack.model_dump())
 

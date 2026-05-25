@@ -8,10 +8,12 @@
     :root {
       --bg: #fafafa; --fg: #111; --muted: #666; --card: #fff;
       --border: #e5e5e5; --accent: #2563eb; --good: #16a34a; --warn: #d97706;
+      --series: #2563eb;
     }
     @media (prefers-color-scheme: dark) {
       :root { --bg: #0b0d10; --fg: #e5e7eb; --muted: #9ca3af; --card: #161a1f;
-              --border: #2a313a; --accent: #60a5fa; --good: #4ade80; --warn: #fbbf24; }
+              --border: #2a313a; --accent: #60a5fa; --good: #4ade80; --warn: #fbbf24;
+              --series: #60a5fa; }
     }
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -38,9 +40,16 @@
     th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em;
          color: var(--muted); font-weight: 600; }
     tr:last-child td { border-bottom: none; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
     .chart-wrap { background: var(--card); border: 1px solid var(--border);
                   border-radius: 8px; padding: 1rem; }
     svg { width: 100%; height: 320px; display: block; }
+    .tabs { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: 1rem; }
+    .tab { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+           border-radius: 6px; padding: .35rem .8rem; font-size: .85rem;
+           cursor: pointer; font-family: inherit; transition: all .15s; }
+    .tab:hover { border-color: var(--accent); }
+    .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
     .footer { color: var(--muted); font-size: .8rem; margin-top: 2rem;
               padding-top: 1rem; border-top: 1px solid var(--border); }
     code { font-family: ui-monospace, Menlo, monospace; font-size: .85em;
@@ -74,14 +83,32 @@
       <div class="sub" id="thru_sub">rolling 1h</div></div>
     <div class="card"><div class="label">active training time</div>
       <div class="value" id="elapsed">—</div>
-      <div class="sub" id="elapsed_sub">excludes idle stalls (>10 min gaps)</div></div>
+      <div class="sub" id="elapsed_sub">excludes idle stalls (&gt;10 min gaps)</div></div>
     <div class="card"><div class="label">best val loss</div>
       <div class="value" id="best">—</div>
       <div class="sub" id="best_sub">—</div></div>
   </div>
 
-  <h2>val loss over rounds</h2>
-  <div class="chart-wrap"><svg id="chart" viewBox="0 0 1200 320" preserveAspectRatio="none"></svg></div>
+  <div class="grid" style="margin-top:1rem">
+    <div class="card"><div class="label">power draw (cohort)</div>
+      <div class="value" id="power">—</div>
+      <div class="sub" id="power_sub">last round, mean × n_reporting</div></div>
+    <div class="card"><div class="label">energy used</div>
+      <div class="value" id="energy">—</div>
+      <div class="sub" id="energy_sub">cumulative since start</div></div>
+    <div class="card"><div class="label">energy / round (avg)</div>
+      <div class="value" id="energy_rate">—</div>
+      <div class="sub" id="energy_rate_sub">—</div></div>
+    <div class="card"><div class="label">est. electricity cost</div>
+      <div class="value" id="cost">—</div>
+      <div class="sub" id="cost_sub">@ €0.30 / kWh (EU avg, configurable)</div></div>
+  </div>
+
+  <h2>training metric over rounds</h2>
+  <div class="chart-wrap">
+    <div class="tabs" id="metricTabs"></div>
+    <svg id="chart" viewBox="0 0 1200 320" preserveAspectRatio="none"></svg>
+  </div>
 
   <h2>current round</h2>
   <div class="card">
@@ -96,8 +123,12 @@
   <h2>recent rounds (last 20)</h2>
   <div class="card" style="padding:0">
     <table>
-      <thead><tr><th>round</th><th>val loss</th><th>FLOPs total</th><th>at</th></tr></thead>
-      <tbody id="history"><tr><td colspan="4" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
+      <thead><tr>
+        <th>round</th><th>val loss</th><th class="num">tok/s</th>
+        <th class="num">watts</th><th class="num">round (s)</th>
+        <th class="num">energy (Wh)</th><th class="num">FLOPs total</th><th>at</th>
+      </tr></thead>
+      <tbody id="history"><tr><td colspan="8" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -107,6 +138,9 @@
   </div>
 
 <script>
+// ---------------------------------------------------------------------------
+// Formatters
+// ---------------------------------------------------------------------------
 function fmtFlops(n) {
   if (n == null) return "—";
   if (n >= 1e18) return (n/1e18).toFixed(2) + " EFLOP";
@@ -136,17 +170,117 @@ function fmtClock(s) {
   const h = Math.floor(s/3600), m = Math.round((s - h*3600)/60);
   return m ? `${h}h ${m}m` : `${h}h`;
 }
+function fmtWatts(w) {
+  if (w == null) return "—";
+  if (w >= 1000) return (w/1000).toFixed(2) + " kW";
+  return w.toFixed(0) + " W";
+}
+function fmtEnergy(wh) {
+  if (wh == null) return "—";
+  if (wh >= 1e6) return (wh/1e6).toFixed(2) + " MWh";
+  if (wh >= 1000) return (wh/1000).toFixed(2) + " kWh";
+  if (wh >= 1) return wh.toFixed(1) + " Wh";
+  if (wh > 0) return (wh*1000).toFixed(1) + " mWh";
+  return "0 Wh";
+}
+function fmtMoney(eur) {
+  if (eur == null) return "—";
+  if (eur >= 1000) return "€" + eur.toFixed(0);
+  if (eur >= 1) return "€" + eur.toFixed(2);
+  if (eur >= 0.01) return "€" + eur.toFixed(3);
+  return "<€0.01";
+}
+function fmtTokPerS(tps) {
+  if (tps == null) return "—";
+  if (tps >= 1e6) return (tps/1e6).toFixed(2) + "M tok/s";
+  if (tps >= 1000) return (tps/1000).toFixed(2) + "k tok/s";
+  return tps.toFixed(0) + " tok/s";
+}
 
 // Round-to-round gaps larger than this are treated as idle (M5 stalled,
 // coord restart, blocked on quorum, etc.) and excluded from "active training".
 const STALL_THRESHOLD_S = 600;
+const COST_PER_KWH_EUR = 0.30;  // EU 2025 industrial-tier rough avg
 
+// ---------------------------------------------------------------------------
+// Chart metric registry — to add a series, just append an entry here.
+// ---------------------------------------------------------------------------
+const METRICS = {
+  val_loss: {
+    label: "val loss",
+    extract: h => h.val_loss,
+    fmt: v => v.toFixed(4),
+    lowerIsBetter: true,
+  },
+  perplexity: {
+    label: "perplexity",
+    extract: h => h.val_loss == null ? null : Math.exp(h.val_loss),
+    fmt: v => v.toFixed(1),
+    lowerIsBetter: true,
+  },
+  tokens_per_sec: {
+    label: "tokens / sec (cohort)",
+    extract: h => h.tokens_per_sec,
+    fmt: v => fmtTokPerS(v),
+    lowerIsBetter: false,
+  },
+  power_watts: {
+    label: "power (W)",
+    extract: h => h.power_watts,
+    fmt: v => fmtWatts(v),
+    lowerIsBetter: false,
+  },
+  round_seconds: {
+    label: "round duration (s)",
+    extract: h => h.round_seconds,
+    fmt: v => fmtClock(v),
+    lowerIsBetter: true,
+  },
+  flops_per_sec: {
+    label: "FLOPs / sec",
+    extract: (h, i, arr) => {
+      // numeric derivative: (flops_total[i] - flops_total[i-1]) / (ts[i] - ts[i-1])
+      if (i === 0) return null;
+      const dF = h.flops_total - arr[i-1].flops_total;
+      const dT = h.ts - arr[i-1].ts;
+      if (dT <= 0 || dT > STALL_THRESHOLD_S) return null;
+      return dF / dT;
+    },
+    fmt: v => fmtFlops(v) + "/s",
+    lowerIsBetter: false,
+  },
+  energy_wh_total: {
+    label: "energy used (Wh, cumulative)",
+    extract: h => h.energy_wh_total,
+    fmt: v => fmtEnergy(v),
+    lowerIsBetter: false,
+  },
+};
+
+let currentMetric = "val_loss";
+
+function buildTabs() {
+  const tabs = document.getElementById("metricTabs");
+  tabs.innerHTML = Object.entries(METRICS).map(([k, m]) =>
+    `<button class="tab ${k === currentMetric ? 'active' : ''}" data-metric="${k}">${m.label}</button>`
+  ).join("");
+  tabs.querySelectorAll(".tab").forEach(btn => {
+    btn.addEventListener("click", () => {
+      currentMetric = btn.dataset.metric;
+      tabs.querySelectorAll(".tab").forEach(b =>
+        b.classList.toggle("active", b.dataset.metric === currentMetric));
+      if (window._lastHistory) drawChart(window._lastHistory);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Aggregated metrics from history
+// ---------------------------------------------------------------------------
 function computeMetrics(hist) {
   if (!hist || hist.length < 1) return {};
   const m = {};
 
-  // Per-round seconds + accumulators: "active" sums sane gaps, "idle" sums stalls.
-  // We also use this to compute avg_round_seconds from the last 10 active gaps.
   const activeDeltas = [];
   let activeSec = 0, idleSec = 0;
   for (let i = 1; i < hist.length; i++) {
@@ -169,12 +303,11 @@ function computeMetrics(hist) {
   m.active_training_seconds = activeSec;
   m.idle_seconds = idleSec;
 
-  // wall clock from first → last (kept for the sub-line)
   if (hist.length >= 2 && hist[0].ts > 0 && hist[hist.length - 1].ts > 0) {
     m.wall_clock_seconds = hist[hist.length - 1].ts - hist[0].ts;
   }
 
-  // throughput in last hour: FLOPs/sec
+  // throughput (FLOPs/sec) in last hour
   const now = hist[hist.length - 1].ts;
   const cutoff = now - 3600;
   const recent = hist.filter(h => h.ts >= cutoff);
@@ -184,8 +317,7 @@ function computeMetrics(hist) {
     if (dT > 0) m.recent_flops_per_sec = dF / dT;
   }
 
-  // best val loss + most recent non-null val_loss (used as fallback for the
-  // hero tile when the coord's last_val_loss is null right after a restart)
+  // best + latest val_loss
   const losses = hist.filter(h => h.val_loss != null);
   if (losses.length) {
     let bestRow = losses[0];
@@ -196,40 +328,69 @@ function computeMetrics(hist) {
     m.latest_val_loss = lastRow.val_loss;
     m.latest_val_round = lastRow.round;
   }
+
+  // Energy / round (only rounds that recorded energy)
+  const energyRows = hist.filter(h => h.energy_wh_total != null);
+  if (energyRows.length >= 2) {
+    const first = energyRows[0], last = energyRows[energyRows.length - 1];
+    const dE = last.energy_wh_total - first.energy_wh_total;
+    const dR = last.round - first.round;
+    if (dR > 0) m.avg_energy_wh_per_round = dE / dR;
+  } else if (energyRows.length === 1 && energyRows[0].energy_wh_total > 0) {
+    // single point: best we can do is divide by the round count
+    m.avg_energy_wh_per_round = energyRows[0].energy_wh_total / Math.max(1, energyRows[0].round + 1);
+  }
+
   return m;
 }
 
+// ---------------------------------------------------------------------------
+// Chart drawing (single-series; series chosen by currentMetric)
+// ---------------------------------------------------------------------------
 function drawChart(history) {
   const svg = document.getElementById("chart");
-  const data = (history || []).filter(h => h.val_loss != null);
-  if (data.length < 2) {
-    svg.innerHTML = '<text x="600" y="160" text-anchor="middle" fill="#999" font-size="14">need ≥2 rounds with val_loss</text>';
+  const metric = METRICS[currentMetric];
+  const histArr = history || [];
+  // Build points: only entries where the metric is defined
+  const pts = [];
+  for (let i = 0; i < histArr.length; i++) {
+    const y = metric.extract(histArr[i], i, histArr);
+    if (y != null && Number.isFinite(y)) {
+      pts.push({ round: histArr[i].round, y });
+    }
+  }
+  if (pts.length < 2) {
+    svg.innerHTML = `<text x="600" y="160" text-anchor="middle" fill="#999" font-size="14">need ≥2 rounds with ${metric.label} — currently ${pts.length}</text>`;
     return;
   }
-  const w = 1200, h = 320, padL = 60, padR = 20, padT = 20, padB = 40;
-  const xs = data.map(d => d.round);
-  const ys = data.map(d => d.val_loss);
+  const w = 1200, h = 320, padL = 80, padR = 20, padT = 20, padB = 40;
+  const xs = pts.map(p => p.round);
+  const ys = pts.map(p => p.y);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  let minY = Math.min(...ys), maxY = Math.max(...ys);
+  if (minY === maxY) { minY -= 1; maxY += 1; }  // avoid zero range
   const xS = x => padL + (x - minX) / Math.max(1, maxX - minX) * (w - padL - padR);
-  const yS = y => padT + (1 - (y - minY) / Math.max(0.01, maxY - minY)) * (h - padT - padB);
-  const points = data.map(d => `${xS(d.round)},${yS(d.val_loss)}`).join(" ");
+  const yS = y => padT + (1 - (y - minY) / Math.max(1e-9, maxY - minY)) * (h - padT - padB);
+  const points = pts.map(p => `${xS(p.round)},${yS(p.y)}`).join(" ");
   const gridY = [minY, (minY + maxY) / 2, maxY];
   let html = "";
   for (const v of gridY) {
     const y = yS(v);
     html += `<line x1="${padL}" x2="${w - padR}" y1="${y}" y2="${y}" stroke="#ccc" stroke-dasharray="2,3" stroke-width=".5"/>`;
-    html += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="#888">${v.toFixed(3)}</text>`;
+    html += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="#888">${metric.fmt(v)}</text>`;
   }
   html += `<text x="${padL}" y="${h - 10}" font-size="11" fill="#888">round ${minX}</text>`;
   html += `<text x="${w - padR}" y="${h - 10}" text-anchor="end" font-size="11" fill="#888">round ${maxX}</text>`;
-  html += `<polyline points="${points}" fill="none" stroke="#2563eb" stroke-width="2"/>`;
-  const last = data[data.length - 1];
-  html += `<circle cx="${xS(last.round)}" cy="${yS(last.val_loss)}" r="4" fill="#2563eb"/>`;
-  html += `<text x="${xS(last.round) - 8}" y="${yS(last.val_loss) - 8}" text-anchor="end" font-size="12" font-weight="600" fill="#2563eb">${last.val_loss.toFixed(4)}</text>`;
+  html += `<polyline points="${points}" fill="none" stroke="var(--series)" stroke-width="2"/>`;
+  const last = pts[pts.length - 1];
+  html += `<circle cx="${xS(last.round)}" cy="${yS(last.y)}" r="4" fill="var(--series)"/>`;
+  html += `<text x="${xS(last.round) - 8}" y="${yS(last.y) - 8}" text-anchor="end" font-size="12" font-weight="600" fill="var(--series)">${metric.fmt(last.y)}</text>`;
   svg.innerHTML = html;
 }
 
+// ---------------------------------------------------------------------------
+// Poll loop
+// ---------------------------------------------------------------------------
 let lastRound = -1, lastBumpAt = Date.now();
 async function refresh() {
   try {
@@ -240,9 +401,11 @@ async function refresh() {
     document.getElementById("round").textContent = status.current_round;
     document.getElementById("round_sub").textContent =
       status.round_open_seconds != null ? `open ${fmtSeconds(status.round_open_seconds)}` : "—";
-    // Fall back to most recent val_loss from history when status hasn't seen
-    // a fresh delta yet (typically right after a coord restart).
+
+    // Val loss with history fallback (handles coord restarts where last_val_loss
+    // is null until the first delta of the new session lands).
     let _hist = (histResp.history || []);
+    window._lastHistory = _hist;
     let _displayVal = status.last_val_loss;
     let _displaySource = "";
     if (_displayVal == null) {
@@ -260,6 +423,7 @@ async function refresh() {
       _displayVal != null
         ? "perplexity " + Math.exp(_displayVal).toFixed(1) + _displaySource
         : "perplexity —";
+
     document.getElementById("flops").textContent = fmtFlops(status.flops_total);
     document.getElementById("flops_sub").textContent =
       ((status.flops_total / 1e25) * 100).toFixed(4) + "% of 10²⁵ systemic-risk line";
@@ -285,9 +449,11 @@ async function refresh() {
 
     const hist = _hist;
     const m = computeMetrics(hist);
+
+    // perf tiles
     document.getElementById("rtime").textContent = m.avg_round_seconds ? fmtClock(m.avg_round_seconds) : "—";
     document.getElementById("rtime_sub").textContent = m.avg_round_seconds
-      ? `${(60 / (m.avg_round_seconds / 60)).toFixed(1)} rounds/hour`
+      ? `${(3600 / m.avg_round_seconds).toFixed(1)} rounds/hour`
       : "need ≥2 rounds";
     document.getElementById("thru").textContent = m.recent_flops_per_sec
       ? fmtFlops(m.recent_flops_per_sec) + "/s"
@@ -297,12 +463,8 @@ async function refresh() {
       : "need ≥2 rounds in last 1h";
     document.getElementById("elapsed").textContent = fmtClock(m.active_training_seconds);
     let elapsedSub = `${hist.length} rounds recorded`;
-    if (m.wall_clock_seconds) {
-      elapsedSub += ` · wall ${fmtClock(m.wall_clock_seconds)}`;
-    }
-    if (m.idle_seconds && m.idle_seconds > 60) {
-      elapsedSub += ` · idle ${fmtClock(m.idle_seconds)}`;
-    }
+    if (m.wall_clock_seconds) elapsedSub += ` · wall ${fmtClock(m.wall_clock_seconds)}`;
+    if (m.idle_seconds && m.idle_seconds > 60) elapsedSub += ` · idle ${fmtClock(m.idle_seconds)}`;
     document.getElementById("elapsed_sub").textContent = elapsedSub;
     document.getElementById("best").textContent = m.best_val_loss != null
       ? m.best_val_loss.toFixed(4)
@@ -311,17 +473,59 @@ async function refresh() {
       ? `at round ${m.best_val_round} · ppl ${Math.exp(m.best_val_loss).toFixed(1)}`
       : "—";
 
+    // energy tiles
+    let powerVal = status.last_power_watts;
+    if (powerVal == null) {
+      for (let i = hist.length - 1; i >= 0; i--) {
+        if (hist[i].power_watts != null) { powerVal = hist[i].power_watts; break; }
+      }
+    }
+    document.getElementById("power").textContent = fmtWatts(powerVal);
+    const cohortCount = hist.length ? (hist[hist.length-1].n_workers || 1) : 1;
+    document.getElementById("power_sub").textContent = powerVal != null
+      ? `${cohortCount} reporting worker(s) last round`
+      : "no worker has reported power yet";
+
+    const energy = status.energy_wh_total || 0;
+    document.getElementById("energy").textContent = fmtEnergy(energy);
+    document.getElementById("energy_sub").textContent = energy > 0
+      ? `over ${hist.length} round(s)`
+      : "no power telemetry yet";
+
+    document.getElementById("energy_rate").textContent = m.avg_energy_wh_per_round
+      ? fmtEnergy(m.avg_energy_wh_per_round) + " / round"
+      : "—";
+    document.getElementById("energy_rate_sub").textContent = m.avg_energy_wh_per_round && m.avg_round_seconds
+      ? `≈ ${fmtEnergy(m.avg_energy_wh_per_round * 3600 / m.avg_round_seconds)} / hour at current cadence`
+      : "—";
+
+    const eur = (energy / 1000) * COST_PER_KWH_EUR;
+    document.getElementById("cost").textContent = fmtMoney(eur);
+    document.getElementById("cost_sub").textContent = `@ €${COST_PER_KWH_EUR.toFixed(2)} / kWh (EU avg, configurable)`;
+
     drawChart(hist);
-    const rows = hist.slice(-20).reverse().map(r =>
-      `<tr><td>${r.round}</td><td>${r.val_loss != null ? r.val_loss.toFixed(4) : '—'}</td>` +
-      `<td>${fmtFlops(r.flops_total)}</td><td>${fmtTime(r.ts)}</td></tr>`).join("");
-    document.getElementById("history").innerHTML = rows || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">no outer steps yet</td></tr>';
+
+    // recent rounds table
+    const rows = hist.slice(-20).reverse().map(r => {
+      const energyCell = r.energy_wh_total != null ? fmtEnergy(r.energy_wh_total) : '—';
+      return `<tr><td>${r.round}</td>` +
+        `<td>${r.val_loss != null ? r.val_loss.toFixed(4) : '—'}</td>` +
+        `<td class="num">${r.tokens_per_sec != null ? fmtTokPerS(r.tokens_per_sec) : '—'}</td>` +
+        `<td class="num">${r.power_watts != null ? fmtWatts(r.power_watts) : '—'}</td>` +
+        `<td class="num">${r.round_seconds != null ? fmtClock(r.round_seconds) : '—'}</td>` +
+        `<td class="num">${energyCell}</td>` +
+        `<td class="num">${fmtFlops(r.flops_total)}</td>` +
+        `<td>${fmtTime(r.ts)}</td></tr>`;
+    }).join("");
+    document.getElementById("history").innerHTML = rows
+      || '<tr><td colspan="8" style="text-align:center;color:var(--muted)">no outer steps yet</td></tr>';
   } catch (e) {
     document.getElementById("liveDot").textContent = "offline";
     console.error(e);
   }
 }
 
+buildTabs();
 refresh();
 setInterval(refresh, 5000);
 </script>
