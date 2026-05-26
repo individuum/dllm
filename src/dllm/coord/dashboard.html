@@ -134,6 +134,20 @@
       <div class="sub" id="cost_sub">@ €0.30 / kWh (EU avg, configurable)</div></div>
   </div>
 
+  <div class="card progress-card" id="trainingProgressCard">
+    <div class="progress-head">
+      <span class="title" id="trainingProgressTitle">pre-training — / —</span>
+      <span class="eta" id="trainingProgressEta">—</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="trainingProgressFill"></div>
+    </div>
+    <div class="progress-foot">
+      <span id="trainingProgressFootLeft">—</span>
+      <span id="trainingProgressFootRight">—</span>
+    </div>
+  </div>
+
   <div class="card progress-card" id="progressCard">
     <div class="progress-head">
       <span class="title" id="progressTitle">round —</span>
@@ -506,6 +520,81 @@ function fmtAgo(seconds) {
 // ---------------------------------------------------------------------------
 // Round progress bar
 // ---------------------------------------------------------------------------
+// Pre-training target — number of outer rounds we aim for end-to-end.
+// 1000 ≈ 6.7 epochs through the 600M-token EU corpus; sweet spot for a 124M
+// model on this much data. Edit here (single source of truth), no rebuild.
+const TARGET_ROUNDS = 1000;
+// Tokens trained per outer round = inner_steps × micro_batch × seq_len.
+// Read from /register response normally; hardcoded here as a constant
+// because the dashboard doesn't see register payloads.
+const TOKENS_PER_ROUND = 2000 * 4 * 512;  // = 4_096_000
+
+function fmtDuration(seconds) {
+  if (seconds == null || !isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 90) return `${Math.round(seconds)}s`;
+  if (seconds < 5400) return `${(seconds/60).toFixed(1)}m`;
+  if (seconds < 86400) return `${(seconds/3600).toFixed(1)}h`;
+  if (seconds < 86400 * 14) return `${(seconds/86400).toFixed(1)}d`;
+  return `${(seconds/86400/7).toFixed(1)}w`;
+}
+
+function fmtTokens(n) {
+  if (n == null) return "—";
+  if (n >= 1e12) return (n/1e12).toFixed(2) + " T";
+  if (n >= 1e9) return (n/1e9).toFixed(2) + " B";
+  if (n >= 1e6) return (n/1e6).toFixed(1) + " M";
+  if (n >= 1e3) return (n/1e3).toFixed(1) + " k";
+  return String(n);
+}
+
+function updateTrainingProgress(status, m) {
+  const card = document.getElementById("trainingProgressCard");
+  const titleEl = document.getElementById("trainingProgressTitle");
+  const etaEl = document.getElementById("trainingProgressEta");
+  const fill = document.getElementById("trainingProgressFill");
+  const footL = document.getElementById("trainingProgressFootLeft");
+  const footR = document.getElementById("trainingProgressFootRight");
+
+  const round = status.current_round || 0;
+  const pct = Math.min(100, (round / TARGET_ROUNDS) * 100);
+  const remaining = Math.max(0, TARGET_ROUNDS - round);
+
+  titleEl.textContent = `pre-training ${round} / ${TARGET_ROUNDS} rounds`;
+
+  // Color: gradient toward green as we approach target
+  fill.classList.remove("landing", "late", "overdue", "full");
+  if (pct >= 100) {
+    fill.classList.add("landing", "full");
+  } else if (pct >= 90) {
+    fill.classList.add("landing");
+  }
+  fill.style.width = pct + "%";
+
+  // ETA from rolling avg round time
+  const avgRoundS = m.avg_round_seconds;
+  if (round >= TARGET_ROUNDS) {
+    etaEl.textContent = "target reached";
+  } else if (avgRoundS && avgRoundS > 0) {
+    const etaSec = remaining * avgRoundS;
+    etaEl.textContent = `ETA ${fmtDuration(etaSec)} (${remaining} rounds @ ${fmtClock(avgRoundS)}/round)`;
+  } else {
+    etaEl.textContent = `${remaining} rounds remaining (need ≥2 completed rounds for ETA)`;
+  }
+
+  const tokensTrained = round * TOKENS_PER_ROUND;
+  const tokensBudget = TARGET_ROUNDS * TOKENS_PER_ROUND;
+  footL.textContent = `${pct.toFixed(1)}% complete · ${fmtTokens(tokensTrained)} / ${fmtTokens(tokensBudget)} tokens`;
+
+  // Wall-clock projection: cumulative active training + ETA = expected total
+  const activeSoFar = m.active_training_seconds || 0;
+  if (avgRoundS && avgRoundS > 0 && remaining > 0) {
+    const projectedTotal = activeSoFar + (remaining * avgRoundS);
+    footR.textContent = `projected total runtime: ${fmtDuration(projectedTotal)}`;
+  } else {
+    footR.textContent = "";
+  }
+}
+
 function updateRoundProgress(status, m) {
   const card = document.getElementById("progressCard");
   const titleEl = document.getElementById("progressTitle");
@@ -713,6 +802,7 @@ async function refresh() {
       serverOpenAtAnchor: status.round_open_seconds || 0,
     };
     updateRoundProgress(status, m);
+    updateTrainingProgress(status, m);
 
     drawChart(hist);
 
