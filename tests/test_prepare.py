@@ -244,13 +244,18 @@ def test_every_source_advertises_license_metadata() -> None:
         assert len(src.supported_langs()) > 0
 
 
-def test_every_source_supports_the_5_eu_target_langs() -> None:
-    """Each source we configure for the 5B corpus must speak DE/FR/EN/IT/ES."""
+def test_default_allocation_is_internally_consistent() -> None:
+    """Every (source, lang) in DEFAULT_ALLOC_CHARS must be one the source supports.
+    Partial-coverage sources (Gutenberg en-only) must NOT list de/fr/it/es."""
     from dllm.data import sources
-    from dllm.data.prepare import DEFAULT_LANGS
+    from dllm.data.prepare import DEFAULT_ALLOC_CHARS
 
-    for name in sources.all_source_names():
-        src = sources.load(name)
+    for src_name, lang_budgets in DEFAULT_ALLOC_CHARS.items():
+        src = sources.load(src_name)
         supported = set(src.supported_langs())
-        missing = set(DEFAULT_LANGS) - supported
-        assert not missing, f"{name} can't serve {missing}; needs alternative source"
+        configured = set(lang_budgets)
+        unsupported = configured - supported
+        assert not unsupported, (
+            f"DEFAULT_ALLOC_CHARS[{src_name!r}] requests {unsupported} but "
+            f"{src_name} only supports {supported}"
+        )
