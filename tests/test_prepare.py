@@ -1,38 +1,38 @@
-"""Test the EU corpus prep pipeline with synthetic inputs (no network).
+"""Test the multi-source EU corpus prep pipeline.
 
-Network-dependent fetch is covered by the live `dllm.data.prepare` CLI.
+Network-dependent source fetches are NOT exercised here — they're covered
+by the live `dllm.data.prepare --dry-run` CLI. These tests use synthetic
+sources to verify the orchestration: BPE training, streaming
+tokenization, train/val split, round-robin source interleaving, and
+provenance manifest shape.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
 
+import numpy as np
 import pytest
 
 pytest.importorskip("tokenizers", reason="data extras not installed; run `pip install -e .[data]`")
 
 
-def _synthetic_corpus() -> dict[str, list[str]]:
-    """Tiny multilingual corpus — enough to exercise BPE training in <1s."""
-    return {
-        "en": [
-            "the quick brown fox jumps over the lazy dog. " * 50,
-            "to be or not to be that is the question " * 50,
-        ] * 8,
-        "de": [
-            "der schnelle braune fuchs springt über den faulen hund. " * 50,
-            "sein oder nicht sein das ist hier die frage " * 50,
-        ] * 8,
-        "fr": [
-            "le rapide renard brun saute par-dessus le chien paresseux. " * 50,
-            "être ou ne pas être telle est la question " * 50,
-        ] * 8,
-    }
+def _synthetic_sample() -> list[str]:
+    """Tiny multilingual sample — enough to exercise BPE training in <1s."""
+    return [
+        "the quick brown fox jumps over the lazy dog. " * 50,
+        "to be or not to be that is the question " * 50,
+        "der schnelle braune fuchs springt über den faulen hund. " * 50,
+        "sein oder nicht sein das ist hier die frage " * 50,
+        "le rapide renard brun saute par-dessus le chien paresseux. " * 50,
+        "être ou ne pas être telle est la question " * 50,
+    ] * 4
 
 
 def test_bpe_training_produces_tokenizer() -> None:
     from dllm.data.prepare import EOT_TOKEN, train_bpe
 
-    tok = train_bpe(_synthetic_corpus(), vocab_size=512)
+    tok = train_bpe(_synthetic_sample(), vocab_size=512)
     assert tok.get_vocab_size() <= 512
     assert tok.token_to_id(EOT_TOKEN) is not None
 
@@ -40,37 +40,181 @@ def test_bpe_training_produces_tokenizer() -> None:
 def test_bpe_roundtrip() -> None:
     from dllm.data.prepare import train_bpe
 
-    tok = train_bpe(_synthetic_corpus(), vocab_size=512)
+    tok = train_bpe(_synthetic_sample(), vocab_size=512)
     text = "the quick brown fox"
     enc = tok.encode(text)
     dec = tok.decode(enc.ids)
     assert dec.strip() == text
 
 
-def test_tokenize_and_shard_produces_bins(tmp_path: Path) -> None:
-    from dllm.data.prepare import tokenize_and_shard, train_bpe
+def test_shard_writer_appends_and_flushes(tmp_path: Path) -> None:
+    """ShardWriter accumulates uint16 tokens and flushes in chunks."""
+    from dllm.data.prepare import ShardWriter
 
-    corpus = _synthetic_corpus()
-    tok = train_bpe(corpus, vocab_size=512)
-    info = tokenize_and_shard(corpus, tok, tmp_path, val_frac=0.1)
-    train_bin = tmp_path / "train.bin"
-    val_bin = tmp_path / "val.bin"
-    assert train_bin.exists() and val_bin.exists()
-    assert info["train_tokens"] > 0
-    assert info["val_tokens"] > 0
-    assert set(info["tokens_per_lang"]) == set(corpus)
+    path = tmp_path / "shard.bin"
+    # Small flush size so we exercise the rollover path
+    w = ShardWriter(path, flush_tokens=10)
+    w.append([1, 2, 3])
+    w.append([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])  # forces flush mid-call
+    total = w.close()
+    assert total == 15
+    arr = np.fromfile(path, dtype=np.uint16)
+    assert arr.tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 
-def test_tokenize_dtype_picked_by_vocab_size(tmp_path: Path) -> None:
-    """vocab <= 65535 → uint16; otherwise uint32."""
-    import numpy as np
+def test_split_off_val_takes_last_n_tokens(tmp_path: Path) -> None:
+    from dllm.data.prepare import split_off_val
 
-    from dllm.data.prepare import tokenize_and_shard, train_bpe
+    train = tmp_path / "train.bin"
+    val = tmp_path / "val.bin"
+    n_total = 1000
+    np.arange(n_total, dtype=np.uint16).tofile(train)
+    train_n, val_n = split_off_val(train, val, val_tokens=50)
+    assert train_n == 950
+    assert val_n == 50
+    val_arr = np.fromfile(val, dtype=np.uint16)
+    train_arr = np.fromfile(train, dtype=np.uint16)
+    # Val is the LAST 50 tokens of the original stream
+    assert val_arr.tolist() == list(range(950, 1000))
+    # Train is the first 950 tokens
+    assert train_arr.tolist() == list(range(950))
 
-    corpus = _synthetic_corpus()
-    tok = train_bpe(corpus, vocab_size=512)
-    info = tokenize_and_shard(corpus, tok, tmp_path, val_frac=0.1)
-    assert info["dtype"] == np.uint16.__name__
+
+def test_split_off_val_caps_at_5pct(tmp_path: Path) -> None:
+    """Even if val_tokens is huge, val is capped at 5 % of corpus."""
+    from dllm.data.prepare import split_off_val
+
+    train = tmp_path / "train.bin"
+    val = tmp_path / "val.bin"
+    n_total = 100
+    np.arange(n_total, dtype=np.uint16).tofile(train)
+    # Ask for 90 val tokens, but corpus is 100 → cap at 100/20 = 5
+    train_n, val_n = split_off_val(train, val, val_tokens=90)
+    assert val_n == 5
+    assert train_n == 95
+
+
+# ---------------------------------------------------------------------------
+# Stream corpus orchestration (with fake sources)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSource:
+    """In-memory source for testing stream_corpus + tokenize_streaming."""
+
+    def __init__(self, by_lang: dict[str, list[str]]) -> None:
+        self.by_lang = by_lang
+
+    def iter_docs(self, lang: str, char_budget: int) -> Iterator[str]:
+        emitted = 0
+        for doc in self.by_lang.get(lang, []):
+            if emitted >= char_budget:
+                return
+            yield doc
+            emitted += len(doc)
+
+    def license_info(self) -> dict:
+        return {"name": "fake", "license": "test"}
+
+    def supported_langs(self) -> list[str]:
+        return list(self.by_lang)
+
+
+def _install_fake_sources(monkeypatch, fakes: dict[str, _FakeSource]) -> None:
+    """Patch dllm.data.sources.load + .all_source_names to return fakes."""
+    from dllm.data import sources as src_pkg
+
+    def fake_load(name: str):
+        if name in fakes:
+            return fakes[name]
+        raise ValueError(f"unknown source {name!r}")
+
+    monkeypatch.setattr(src_pkg, "load", fake_load)
+    monkeypatch.setattr(src_pkg, "all_source_names", lambda: tuple(fakes))
+
+
+def test_stream_corpus_round_robins_sources_and_langs(monkeypatch) -> None:
+    """Round-robin order: every (source, lang) pair gets one doc before any
+    pair gets a second. Critical for ShardLoader partitioning."""
+    from dllm.data.prepare import stream_corpus
+
+    a = _FakeSource({"en": ["a-en-1", "a-en-2"], "de": ["a-de-1"]})
+    b = _FakeSource({"en": ["b-en-1"], "de": ["b-de-1", "b-de-2"]})
+    _install_fake_sources(monkeypatch, {"src_a": a, "src_b": b})
+
+    alloc = {"src_a": {"en": 1_000_000, "de": 1_000_000},
+             "src_b": {"en": 1_000_000, "de": 1_000_000}}
+    out = list(stream_corpus(alloc, ["en", "de"]))
+    # 4 (source, lang) pairs * starts at 1 each before any goes to 2nd
+    first_four = [(s, l) for s, l, _ in out[:4]]
+    assert sorted(first_four) == [
+        ("src_a", "de"), ("src_a", "en"), ("src_b", "de"), ("src_b", "en"),
+    ]
+    # Every doc appears exactly once
+    docs = [d for _, _, d in out]
+    assert sorted(docs) == sorted([
+        "a-en-1", "a-en-2", "a-de-1", "b-en-1", "b-de-1", "b-de-2",
+    ])
+
+
+def test_stream_corpus_respects_char_budget(monkeypatch) -> None:
+    from dllm.data.prepare import stream_corpus
+
+    # Each doc is 100 chars, budget is 250 → expect first 3 docs (300 chars > 250 → stops after 3)
+    docs_5 = ["x" * 100 for _ in range(5)]
+    a = _FakeSource({"en": docs_5})
+    _install_fake_sources(monkeypatch, {"src_a": a})
+
+    alloc = {"src_a": {"en": 250}}
+    out = list(stream_corpus(alloc, ["en"]))
+    # Fake source emits while emitted < budget; allows 3rd doc to push over
+    assert len(out) == 3
+
+
+def test_stream_corpus_skips_unsupported_lang(monkeypatch) -> None:
+    """A source that doesn't support a requested lang is silently skipped."""
+    from dllm.data.prepare import stream_corpus
+
+    a = _FakeSource({"en": ["a-en-1"]})  # no DE
+    _install_fake_sources(monkeypatch, {"src_a": a})
+
+    alloc = {"src_a": {"en": 1_000_000, "de": 1_000_000}}
+    out = list(stream_corpus(alloc, ["en", "de"]))
+    langs_seen = {l for _, l, _ in out}
+    assert langs_seen == {"en"}
+
+
+def test_tokenize_streaming_end_to_end(tmp_path: Path, monkeypatch) -> None:
+    """Stream from fake sources → tokenize → split_off_val produces
+    correctly-sized .bin files."""
+    from dllm.data.prepare import (
+        split_off_val,
+        stream_corpus,
+        tokenize_streaming,
+        train_bpe,
+    )
+
+    # Build a small fake corpus
+    sample = _synthetic_sample()
+    a = _FakeSource({"en": sample[:6], "de": sample[6:12]})
+    _install_fake_sources(monkeypatch, {"src_a": a})
+
+    tok = train_bpe(sample, vocab_size=512)
+    alloc = {"src_a": {"en": 100_000, "de": 100_000}}
+    docs = stream_corpus(alloc, ["en", "de"])
+    out = tmp_path / "train.bin"
+    total, per_pair = tokenize_streaming(docs, tok, out)
+    assert total > 0
+    assert out.exists()
+    assert total * 2 == out.stat().st_size  # uint16 = 2 bytes per token
+    # Per-(source, lang) counts populated
+    assert ("src_a", "en") in per_pair
+    assert ("src_a", "de") in per_pair
+
+    val_out = tmp_path / "val.bin"
+    train_n, val_n = split_off_val(out, val_out, val_tokens=10)
+    assert train_n + val_n == total
+    assert val_n == 10
 
 
 def test_default_tokenizer_path_under_cache() -> None:
@@ -81,33 +225,32 @@ def test_default_tokenizer_path_under_cache() -> None:
     assert "cache" in p.parts
 
 
-def test_interleave_round_robins_langs() -> None:
-    """First N docs of the interleaved stream cover all langs (one each)."""
-    from dllm.data.prepare import _interleave_docs
-
-    corpus = {"de": ["de-1", "de-2", "de-3"], "fr": ["fr-1", "fr-2"], "en": ["en-1"]}
-    out = _interleave_docs(corpus)
-    first_three = [lang for lang, _ in out[:3]]
-    assert sorted(first_three) == sorted(corpus)
+# ---------------------------------------------------------------------------
+# Sources subpackage — verify each source advertises license + supported langs
+# ---------------------------------------------------------------------------
 
 
-def test_interleave_preserves_all_docs() -> None:
-    from dllm.data.prepare import _interleave_docs
+def test_every_source_advertises_license_metadata() -> None:
+    """Each source must expose name + license + license_url so the manifest
+    can be assembled even without fetching."""
+    from dllm.data import sources
 
-    corpus = {"a": ["a1", "a2"], "b": ["b1", "b2", "b3"], "c": ["c1"]}
-    out = _interleave_docs(corpus)
-    assert len(out) == sum(len(d) for d in corpus.values())
-    assert {doc for _, doc in out} == {d for docs in corpus.values() for d in docs}
+    required = {"name", "license", "license_url", "url"}
+    for name in sources.all_source_names():
+        src = sources.load(name)
+        info = src.license_info()
+        assert required.issubset(info), f"{name} missing fields: {required - info.keys()}"
+        assert isinstance(src.supported_langs(), list)
+        assert len(src.supported_langs()) > 0
 
 
-def test_interleave_balances_any_contiguous_slice() -> None:
-    """A contiguous half of the interleaved stream should have every lang represented."""
-    from dllm.data.prepare import _interleave_docs
+def test_every_source_supports_the_5_eu_target_langs() -> None:
+    """Each source we configure for the 5B corpus must speak DE/FR/EN/IT/ES."""
+    from dllm.data import sources
+    from dllm.data.prepare import DEFAULT_LANGS
 
-    corpus = {f"l{i}": [f"l{i}-doc{j}" for j in range(20)] for i in range(5)}
-    out = _interleave_docs(corpus)
-    n = len(out)
-    first_half = {lang for lang, _ in out[: n // 2]}
-    second_half = {lang for lang, _ in out[n // 2 :]}
-    assert first_half == set(corpus)
-    assert second_half == set(corpus)
+    for name in sources.all_source_names():
+        src = sources.load(name)
+        supported = set(src.supported_langs())
+        missing = set(DEFAULT_LANGS) - supported
+        assert not missing, f"{name} can't serve {missing}; needs alternative source"

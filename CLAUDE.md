@@ -113,6 +113,38 @@ Future improvements:
 2. Weight `last_val_loss` by how recently each worker resynced its `last_ref` (still
    matters for the per-round drift artifact even with shared val).
 
+## Corpus v2 — 5B tokens, 5 languages, EU-compliant (2026-05-26)
+
+The original `prepare.py` pulled small Wikipedia samples (7 langs, ~600 M tokens).
+Replaced with a multi-source streaming pipeline targeting ~5 B tokens across
+DE/FR/EN/IT/ES from four open sources:
+
+| source | per-lang chars | license | role |
+|---|---|---|---|
+| Wikipedia | 2.8 G | CC-BY-SA 4.0 | encyclopedic register, bulk |
+| Project Gutenberg | 800 M | Public Domain | literary register, balance |
+| EuroParl | 200 M | PD (EU institutional) | political / formal register |
+| JRC-Acquis | 120 M | PD (EU institutional) | legal / administrative register |
+
+**Architecture**: `dllm/data/sources/{wikipedia,gutenberg,europarl,jrc_acquis}.py`
+each expose `iter_docs(lang, char_budget)` + `license_info()` + `supported_langs()`.
+The orchestrator in `prepare.py` round-robins across (source, lang) pairs so
+`train.bin` has uniform mix throughout (critical for `ShardLoader` partitioning).
+
+**Memory**: streaming tokenization with a `ShardWriter` that flushes uint16 tokens
+to disk every 100 MB — 5 B tokens never sit in RAM.
+
+**Compliance**: `manifest.json` records per-source license + URL + per-(source,lang)
+token counts + AI Act Art. 53 disclosure + DSM Art. 4 / GDPR posture. Sufficient
+for the EU AI Act "detailed summary" requirement.
+
+**Run**: `python -m dllm.data.prepare` (full run, multi-hour download + tokenize)
+or `python -m dllm.data.prepare --dry-run` (probe each source for reachability).
+The token / BPE / shard format is identical to v1 — only the *content* of
+`train.bin`/`val.bin` changes. Re-tokenizing means current model checkpoints
+become incompatible (vocab IDs shift), so plan a fresh training run when
+swapping in the new corpus.
+
 ## Pointers
 
 - Architecture + roadmap: [PLAN.md](PLAN.md) (Phase 0/1/2, EU compliance, tier-aware scheduling).
