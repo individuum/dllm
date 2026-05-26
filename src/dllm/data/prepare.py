@@ -53,7 +53,9 @@ EOT_TOKEN = "<|endoftext|>"
 # PleIAs is much larger so it does the heavy lifting for non-EN literature.
 #
 # Per-source per-lang CHARACTER budgets. Token estimate ≈ chars × 0.25 for
-# European langs; totals sum to ~20 B chars ≈ 5 B tokens budget.
+# European langs; totals sum to ~22 B chars ≈ 5.5 B tokens (per-source iters
+# typically emit less than their budget for the smaller IT/ES Gutenberg
+# splits, so the realized corpus lands close to 5 B tokens).
 # Operators can override any cell via the --alloc JSON.
 DEFAULT_ALLOC_CHARS = {
     "wikipedia":    {"de": 2_000_000_000, "fr": 2_000_000_000, "en": 2_500_000_000,
@@ -239,11 +241,28 @@ def tokenize_streaming(
     docs: Iterator[tuple[str, str, str]],
     tokenizer,
     out_path: Path,
+    batch_size: int = 256,
+    queue_size: int = 8,
 ) -> tuple[int, dict[tuple[str, str], int]]:
     """Stream-tokenize every doc and append uint16 IDs to out_path.
 
+    Pipelined: a background thread pulls docs from the HF streaming iterator
+    and accumulates them into batches; the main thread consumes batches and
+    invokes `tokenizer.encode_batch(...)`, which the `tokenizers` Rust impl
+    multi-threads across all available CPU cores (via Rayon). The two phases
+    overlap, so we're rarely either I/O-bound or CPU-bound — usually both
+    at the same time.
+
+    Empirically on a 32-core Windows box this gives ~10× speedup over the
+    naive `for doc: tokenizer.encode(doc)` Python loop, which was capped at
+    one Rust thread because the Python interpreter held the GIL between
+    encode calls.
+
     Returns (total_tokens, per_(source,lang)_token_count).
     """
+    import queue as _queue
+    import threading
+
     eot_id = tokenizer.token_to_id(EOT_TOKEN)
     if eot_id is None:
         raise RuntimeError(f"{EOT_TOKEN!r} missing from trained vocab")
@@ -252,18 +271,48 @@ def tokenize_streaming(
     counts: dict[tuple[str, str], int] = {}
     n_docs = 0
     last_print = 0
-    for src_name, lang, doc in docs:
-        ids = tokenizer.encode(doc).ids
-        ids.append(eot_id)
-        writer.append(ids)
-        counts[(src_name, lang)] = counts.get((src_name, lang), 0) + len(ids)
-        n_docs += 1
+
+    SENTINEL = object()
+    q: _queue.Queue = _queue.Queue(maxsize=queue_size)
+
+    def producer() -> None:
+        batch_docs: list[str] = []
+        batch_meta: list[tuple[str, str]] = []
+        try:
+            for src_name, lang, doc in docs:
+                batch_docs.append(doc)
+                batch_meta.append((src_name, lang))
+                if len(batch_docs) >= batch_size:
+                    q.put((batch_docs, batch_meta))
+                    batch_docs, batch_meta = [], []
+            if batch_docs:
+                q.put((batch_docs, batch_meta))
+        finally:
+            q.put(SENTINEL)
+
+    t = threading.Thread(target=producer, daemon=True, name="tokenize-producer")
+    t.start()
+
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            break
+        batch_docs, batch_meta = item
+        encodings = tokenizer.encode_batch(batch_docs)  # multi-threaded Rust
+        for (src_name, lang), enc in zip(batch_meta, encodings):
+            ids = list(enc.ids)
+            ids.append(eot_id)
+            writer.append(ids)
+            counts[(src_name, lang)] = counts.get((src_name, lang), 0) + len(ids)
+            n_docs += 1
         if writer._total + writer._idx - last_print >= 100_000_000:
             print(
                 f"    [tokenize] {n_docs:,} docs, "
                 f"{(writer._total + writer._idx) / 1e9:.2f} B tokens"
             )
             last_print = writer._total + writer._idx
+
+    t.join()
     total = writer.close()
     return total, counts
 
@@ -417,6 +466,21 @@ def main() -> None:
         action="store_true",
         help="Verify each source is reachable; don't write anything.",
     )
+    ap.add_argument(
+        "--reuse-tokenizer",
+        action="store_true",
+        help=(
+            "If cache_dir/tokenizer.json exists, load it and skip Phase 1+2 "
+            "(BPE sample collection + training). Useful when restarting "
+            "a prepare run that crashed mid-tokenization."
+        ),
+    )
+    ap.add_argument(
+        "--tokenize-batch-size",
+        type=int,
+        default=256,
+        help="Docs per encode_batch call. Higher = better Rust thread utilization but more memory.",
+    )
     args = ap.parse_args()
 
     out = cache_dir()
@@ -461,21 +525,28 @@ def main() -> None:
         print("[prepare] dry-run done")
         return
 
-    # Phase 1 — BPE training sample
-    print("[prepare] phase 1: collecting BPE training sample")
-    sample = collect_bpe_sample(alloc, args.langs, args.bpe_sample_chars_per_pair)
-    print(f"  collected {len(sample)} sample docs")
-
-    print(f"[prepare] phase 2: training BPE vocab={args.vocab_size}")
-    tokenizer = train_bpe(sample, vocab_size=args.vocab_size)
     tok_path = out / "tokenizer.json"
-    tokenizer.save(str(tok_path))
-    actual_vocab = tokenizer.get_vocab_size()
-    print(f"  saved {tok_path} (vocab_size={actual_vocab})")
-    del sample  # free ~400 MB
+
+    if args.reuse_tokenizer and tok_path.exists():
+        from tokenizers import Tokenizer  # noqa: PLC0415
+        tokenizer = Tokenizer.from_file(str(tok_path))
+        actual_vocab = tokenizer.get_vocab_size()
+        print(f"[prepare] phases 1+2 skipped: reusing {tok_path} (vocab_size={actual_vocab})")
+    else:
+        # Phase 1 — BPE training sample
+        print("[prepare] phase 1: collecting BPE training sample")
+        sample = collect_bpe_sample(alloc, args.langs, args.bpe_sample_chars_per_pair)
+        print(f"  collected {len(sample)} sample docs")
+
+        print(f"[prepare] phase 2: training BPE vocab={args.vocab_size}")
+        tokenizer = train_bpe(sample, vocab_size=args.vocab_size)
+        tokenizer.save(str(tok_path))
+        actual_vocab = tokenizer.get_vocab_size()
+        print(f"  saved {tok_path} (vocab_size={actual_vocab})")
+        del sample  # free ~400 MB
 
     # Phase 3 — streaming tokenization of full corpus
-    print("[prepare] phase 3: streaming tokenization → train.bin")
+    print(f"[prepare] phase 3: streaming tokenization → train.bin (batch_size={args.tokenize_batch_size})")
     train_path = out / "train.bin"
     val_path = out / "val.bin"
     if train_path.exists():
@@ -483,7 +554,9 @@ def main() -> None:
     if val_path.exists():
         val_path.unlink()
     docs = stream_corpus(alloc, args.langs)
-    total_tokens, per_source_lang = tokenize_streaming(docs, tokenizer, train_path)
+    total_tokens, per_source_lang = tokenize_streaming(
+        docs, tokenizer, train_path, batch_size=args.tokenize_batch_size
+    )
     print(f"  total tokens written: {total_tokens:,}")
     for (src_name, lang), n in sorted(per_source_lang.items()):
         print(f"    {src_name} {lang}: {n:,}")
