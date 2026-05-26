@@ -25,8 +25,8 @@ CMD [ \
     "--port", "8000", \
     "--preset", "300M", \
     "--world-size", "1", \
-    "--inner-steps", "1500", \
-    "--seq-len", "512", \
+    "--inner-steps", "200", \
+    "--seq-len", "4096", \
     "--micro-batch-size", "4", \
     "--checkpoint-dir", "/data/checkpoints", \
     "--checkpoint-every", "3", \

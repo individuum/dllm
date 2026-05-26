@@ -98,11 +98,24 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.ffn = FeedForward(cfg)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        # Gradient checkpointing trades ~25 % step time for ~50 % activation
+        # memory. Only matters during training (no-op in eval/inference).
+        self._use_grad_checkpoint = cfg.use_grad_checkpoint
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x), freqs_cis)
         x = x + self.ffn(self.ffn_norm(x))
         return x
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        if self._use_grad_checkpoint and self.training and x.requires_grad:
+            # use_reentrant=False is the modern, non-deprecated, mixed-precision-
+            # safe variant. The wrapping closure dodges torch.utils.checkpoint's
+            # quirks around non-tensor arg passthrough (freqs_cis is a buffer).
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl, x, freqs_cis, use_reentrant=False
+            )
+        return self._forward_impl(x, freqs_cis)
 
 
 class Transformer(nn.Module):

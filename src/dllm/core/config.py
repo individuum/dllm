@@ -16,6 +16,11 @@ class ModelConfig:
     rope_theta: float = 500000.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = True
+    # Re-compute attention/FFN activations during backward instead of storing
+    # them. ~25 % slower per step, but cuts activation memory roughly in half,
+    # which is the only way we fit seq=8192 in 12 GB VRAM on a consumer GPU.
+    # Off by default so smaller models / shorter contexts pay no overhead.
+    use_grad_checkpoint: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -59,16 +64,20 @@ PRESETS: dict[str, ModelConfig] = {
         n_kv_heads=4,
         max_seq_len=1024,
     ),
-    # ~300M, GPT-2-medium class — sweet spot for an 11.7 GB consumer
-    # GPU (3060 / 4060 Ti 16G / 4070): model state ~4.8 GB, activations
-    # ~5 GB at batch=4 seq=512 bf16, total ~10 GB with comfortable
-    # headroom. Roughly Chinchilla-optimal for our ~5 B-token corpus.
+    # ~305M, GPT-2-medium class with long-context training enabled.
+    # n_kv_heads=8 (vs 4) lifts GQA ratio from 4:1 to 2:1 — slightly larger
+    # KV cache but more accurate attention, +6 M params. max_seq_len=8192
+    # for training under gradient checkpointing (~9 GB peak VRAM at
+    # batch=4 seq=8192 bf16 on a 3060). RoPE θ=500 000 supports clean
+    # extrapolation past trained range up to ~12 k tokens at inference.
+    # Roughly Chinchilla-optimal for our ~5 B-token corpus.
     "300M": ModelConfig(
         dim=1024,
         n_layers=24,
         n_heads=16,
-        n_kv_heads=4,
-        max_seq_len=1024,
+        n_kv_heads=8,
+        max_seq_len=8192,
+        use_grad_checkpoint=True,
     ),
     # ~1B, Phase 1 target
     "1B": ModelConfig(
