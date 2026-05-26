@@ -33,5 +33,6 @@ CMD [ \
     "--require-signed-deltas", \
     "--round-timeout-seconds", "600", \
     "--min-workers", "1", \
+    "--worker-inactive-timeout-seconds", "1200", \
     "--device", "cpu" \
 ]

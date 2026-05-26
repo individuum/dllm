@@ -217,6 +217,86 @@ def test_cohort_power_is_sum_not_mean_with_two_workers(tmp_path: Path) -> None:
     assert status["last_tokens_per_sec"] == pytest.approx(18500.0)
 
 
+def test_stale_workers_get_evicted(tmp_path: Path) -> None:
+    """Worker registrations whose last_seen_ts is older than the inactive
+    timeout get dropped automatically — prevents ghost workers from piling
+    up in the dashboard (the M5 / "registered twice" scenario).
+    """
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    state = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        worker_inactive_timeout_seconds=60.0,  # 60s for the test
+        enable_timeout_thread=False,  # we drive evict manually
+    )
+    client = TestClient(create_app(state))
+    sk_old = load_or_create_identity(tmp_path / "id_old.key")
+    sk_new = load_or_create_identity(tmp_path / "id_new.key")
+
+    # Ghost worker: registered, never submitted, registered_at is old
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk_old), preset="smoke").model_dump(),
+    )
+    state.workers[0]["registered_at"] = 0.0  # epoch — definitely older than 60s
+
+    # Fresh worker: just registered
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk_new), preset="smoke").model_dump(),
+    )
+
+    # Before eviction: both registered
+    assert len(state.workers) == 2
+
+    n_evicted = state._evict_stale_workers()
+    assert n_evicted == 1
+    # Only the fresh worker survives — and its worker_id was re-mapped to whatever
+    # registered second (worker_id=1 here)
+    assert list(state.workers.keys()) == [1]
+
+
+def test_eviction_respects_recently_contributed_worker(tmp_path: Path) -> None:
+    """A worker that submitted recently shouldn't be evicted, even if it
+    registered long ago."""
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    state = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        worker_inactive_timeout_seconds=60.0,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(state))
+    sk = load_or_create_identity(tmp_path / "id.key")
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+    )
+
+    import time as _t
+    # Old registration but recent activity
+    state.workers[0]["registered_at"] = 0.0
+    state.workers[0]["last_seen_ts"] = _t.time()  # now
+
+    n_evicted = state._evict_stale_workers()
+    assert n_evicted == 0
+    assert len(state.workers) == 1
+
+
 def test_workers_endpoint_lists_per_worker_stats(state: CoordinatorState, tmp_path: Path) -> None:
     """GET /workers returns each registered worker's contribution stats."""
     client = TestClient(create_app(state))

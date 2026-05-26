@@ -70,6 +70,7 @@ class CoordinatorState:
         require_signed_deltas: bool = False,
         round_timeout_seconds: float = 900.0,
         min_workers: int = 1,
+        worker_inactive_timeout_seconds: float = 1800.0,
         enable_timeout_thread: bool = True,
     ) -> None:
         if preset_name not in PRESETS:
@@ -91,6 +92,13 @@ class CoordinatorState:
         # resync path on the worker side.
         self.round_timeout_seconds = max(0.0, round_timeout_seconds)
         self.min_workers = max(1, min(min_workers, world_size))
+        # Auto-evict registrations inactive longer than this. Same physical
+        # GPU coming back from a crash/restart re-registers cleanly with a
+        # fresh worker_id; the old ghost is dropped so the dashboard "active
+        # workers" table doesn't show stale entries forever and so
+        # world_size matches the count of actually-contributing workers.
+        # 0 disables auto-eviction.
+        self.worker_inactive_timeout_seconds = max(0.0, worker_inactive_timeout_seconds)
         # Ring buffer of (round, val_loss, flops_total, ts) appended at each
         # outer step. Powers the dashboard chart at GET /.
         # Persisted to <checkpoint_dir>/history.jsonl (append-only NDJSON)
@@ -265,12 +273,53 @@ class CoordinatorState:
     # -- timeout-based round eviction ----------------------------------------
 
     def _timeout_loop(self) -> None:
-        """Background thread: poll for timed-out rounds and force-advance them."""
+        """Background thread: poll for timed-out rounds and stale workers."""
         while not self._timeout_stop.wait(timeout=2.0):
             try:
                 self._check_and_force_advance()
             except Exception:  # noqa: BLE001
                 log.exception("timeout-thread error")
+            try:
+                self._evict_stale_workers()
+            except Exception:  # noqa: BLE001
+                log.exception("evict-thread error")
+
+    def _evict_stale_workers(self) -> int:
+        """Drop registrations whose last_seen_ts is older than the inactive
+        timeout. A worker that's never submitted a delta uses registered_at
+        as its anchor — so an initial-pull worker has the full timeout to
+        get its first delta in.
+
+        Returns the count evicted (mostly for tests). Caller acquires `lock`
+        below if needed; we acquire it here too so the call is safe from any
+        thread.
+        """
+        if self.worker_inactive_timeout_seconds <= 0:
+            return 0
+        with self.lock:
+            now = time.time()
+            cutoff = now - self.worker_inactive_timeout_seconds
+            to_evict: list[int] = []
+            for wid, w in self.workers.items():
+                last_seen = w.get("last_seen_ts")
+                anchor = last_seen if last_seen is not None else w.get("registered_at", 0.0)
+                if anchor < cutoff:
+                    to_evict.append(wid)
+            for wid in to_evict:
+                last_seen = self.workers[wid].get("last_seen_ts")
+                log.warning(
+                    "[EVICT] worker_id=%d inactive >%.0fs (last_seen=%s); "
+                    "dropping registration. If the worker comes back it'll "
+                    "register fresh with a new id.",
+                    wid,
+                    self.worker_inactive_timeout_seconds,
+                    "never" if last_seen is None else f"{now - last_seen:.0f}s ago",
+                )
+                del self.workers[wid]
+                # Clear any unconsumed delta in the current round so the
+                # outer step's quorum check reflects the surviving cohort.
+                self.deltas.get(self.round, {}).pop(wid, None)
+            return len(to_evict)
 
     def _check_and_force_advance(self) -> bool:
         """Idempotent. If round has been open > timeout AND >= min_workers have
@@ -712,6 +761,16 @@ def main() -> None:
         default=1,
         help="Minimum deltas needed for a timed-out round to advance (clamped to [1, world_size]).",
     )
+    ap.add_argument(
+        "--worker-inactive-timeout-seconds",
+        type=float,
+        default=1800.0,
+        help=(
+            "Auto-evict worker registrations inactive for longer than this. "
+            "Prevents ghost workers (same GPU re-registering after crashes) "
+            "from piling up in the dashboard's active-workers table. 0 disables."
+        ),
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -746,6 +805,7 @@ def main() -> None:
         require_signed_deltas=args.require_signed_deltas,
         round_timeout_seconds=args.round_timeout_seconds,
         min_workers=args.min_workers,
+        worker_inactive_timeout_seconds=args.worker_inactive_timeout_seconds,
     )
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
