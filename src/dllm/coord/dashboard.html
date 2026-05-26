@@ -177,7 +177,7 @@
         <th class="num">last val</th>
         <th>last seen</th>
       </tr></thead>
-      <tbody id="workers"><tr><td colspan="9" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
+      <tbody id="workers_table"><tr><td colspan="9" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -454,7 +454,7 @@ function drawChart(history) {
 // ---------------------------------------------------------------------------
 function renderWorkersTable(workers, currentRound) {
   if (!workers.length) {
-    document.getElementById("workers").innerHTML =
+    document.getElementById("workers_table").innerHTML =
       '<tr><td colspan="9" style="text-align:center;color:var(--muted)">no workers registered</td></tr>';
     return;
   }
@@ -492,7 +492,7 @@ function renderWorkersTable(workers, currentRound) {
       `<td>${lastSeenStr}${statusBadge}</td>` +
       `</tr>`;
   }).join("");
-  document.getElementById("workers").innerHTML = rows;
+  document.getElementById("workers_table").innerHTML = rows;
 }
 
 function fmtAgo(seconds) {
@@ -724,7 +724,7 @@ async function refresh() {
       renderWorkersTable(workersResp.workers || [], status.current_round);
     } catch (e) {
       // non-fatal: the rest of the dashboard works without this
-      document.getElementById("workers").innerHTML =
+      document.getElementById("workers_table").innerHTML =
         '<tr><td colspan="9" style="text-align:center;color:var(--muted)">workers endpoint unreachable</td></tr>';
     }
 
