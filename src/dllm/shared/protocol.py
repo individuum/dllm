@@ -38,8 +38,29 @@ class RoundStatus(BaseModel):
     # Energy / cohort throughput. Both populated as soon as workers start
     # reporting power_watts + tokens_per_sec on /delta.
     energy_wh_total: float = 0.0  # cumulative Wh used by the cohort
-    last_power_watts: float | None = None  # mean cohort draw during previous round
+    last_power_watts: float | None = None  # COHORT sum of last round's draws
+    last_power_watts_per_worker: float | None = None  # mean for reference
+    last_n_reporting_workers: int = 0  # how many workers' power numbers fed the sum
     last_tokens_per_sec: float | None = None  # summed cohort throughput, previous round
+
+
+class WorkerInfo(BaseModel):
+    worker_id: int
+    country: str
+    gpu: str
+    vram_gb: int = 0
+    ram_gb: int = 0
+    registered_at: float
+    rounds_contributed: int = 0
+    last_seen_ts: float | None = None
+    last_round: int | None = None  # last round this worker submitted a delta for
+    last_val_loss: float | None = None
+    last_power_watts: float | None = None
+    last_tokens_per_sec: float | None = None
+
+
+class WorkersResponse(BaseModel):
+    workers: list[WorkerInfo]
 
 
 class DeltaAck(BaseModel):

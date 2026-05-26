@@ -159,6 +159,118 @@ def test_history_records_power_and_energy(
     assert status["energy_wh_total"] >= 0  # >= 0 because TestClient rounds may be ~0s
 
 
+def test_cohort_power_is_sum_not_mean_with_two_workers(tmp_path: Path) -> None:
+    """The "POWER DRAW (COHORT)" tile should be the SUM across reporting workers
+    (because workers train simultaneously). Was a bug: the coord recorded the
+    MEAN, which made the tile drop when a low-power worker (M5 at ~35W) joined
+    a high-power worker (3060 at ~140W). After the fix the tile climbs.
+    """
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    state = CoordinatorState(
+        preset_name="smoke",
+        world_size=2,  # 2 workers needed before the outer step fires
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(state))
+    sk_a = load_or_create_identity(tmp_path / "id_a.key")
+    sk_b = load_or_create_identity(tmp_path / "id_b.key")
+    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke").model_dump())
+
+    snap = snapshot(state.model)
+    with torch.no_grad():
+        for p in state.model.parameters():
+            p.add_(torch.randn_like(p) * 0.001)
+    delta = compute_delta(snap, state.model)
+    with torch.no_grad():
+        for n, p in state.model.named_parameters():
+            p.copy_(snap[n])
+    blob = state_to_bytes(delta)
+
+    # Worker A reports 140 W (3060-ish), worker B reports 35 W (M5-ish)
+    for wid, sk, pw, tps in [(0, sk_a, 140.0, 15000.0), (1, sk_b, 35.0, 3500.0)]:
+        sig = sign_delta(sk, wid, 0, blob)
+        client.post(
+            "/delta",
+            params={
+                "worker_id": wid, "round": 0,
+                "val_loss": 5.0, "power_watts": pw, "tokens_per_sec": tps,
+            },
+            content=blob,
+            headers={"content-type": "application/octet-stream", "x-delta-signature": sig},
+        )
+
+    status = client.get("/status").json()
+    # COHORT sum, NOT mean: 140 + 35 = 175 W (the bug returned 87.5 W)
+    assert status["last_power_watts"] == pytest.approx(175.0)
+    # mean is still exposed for the dashboard's "avg per worker" sub-line
+    assert status["last_power_watts_per_worker"] == pytest.approx(87.5)
+    assert status["last_n_reporting_workers"] == 2
+    # tok/s remains a sum
+    assert status["last_tokens_per_sec"] == pytest.approx(18500.0)
+
+
+def test_workers_endpoint_lists_per_worker_stats(state: CoordinatorState, tmp_path: Path) -> None:
+    """GET /workers returns each registered worker's contribution stats."""
+    client = TestClient(create_app(state))
+    sk = load_or_create_identity(tmp_path / "id.key")
+    client.post(
+        "/register",
+        json=RegisterRequest(
+            pubkey=pubkey_hex(sk), preset="smoke", country="DE", gpu="RTX 3060", vram_gb=11
+        ).model_dump(),
+    )
+
+    # Before any delta: registered but never contributed
+    workers = client.get("/workers").json()["workers"]
+    assert len(workers) == 1
+    w = workers[0]
+    assert w["worker_id"] == 0
+    assert w["country"] == "DE"
+    assert w["gpu"] == "RTX 3060"
+    assert w["vram_gb"] == 11
+    assert w["rounds_contributed"] == 0
+    assert w["last_seen_ts"] is None  # the "never contributed" sentinel
+    assert w["last_round"] is None
+
+    # Submit one delta; stats should update
+    snap = snapshot(state.model)
+    with torch.no_grad():
+        for p in state.model.parameters():
+            p.add_(torch.randn_like(p) * 0.001)
+    delta = compute_delta(snap, state.model)
+    with torch.no_grad():
+        for n, p in state.model.named_parameters():
+            p.copy_(snap[n])
+    blob = state_to_bytes(delta)
+    sig = sign_delta(sk, 0, 0, blob)
+    client.post(
+        "/delta",
+        params={
+            "worker_id": 0, "round": 0,
+            "val_loss": 4.2, "power_watts": 142.0, "tokens_per_sec": 15500.0,
+        },
+        content=blob,
+        headers={"content-type": "application/octet-stream", "x-delta-signature": sig},
+    )
+
+    workers = client.get("/workers").json()["workers"]
+    w = workers[0]
+    assert w["rounds_contributed"] == 1
+    assert w["last_round"] == 0
+    assert w["last_seen_ts"] is not None
+    assert w["last_val_loss"] == pytest.approx(4.2)
+    assert w["last_power_watts"] == pytest.approx(142.0)
+    assert w["last_tokens_per_sec"] == pytest.approx(15500.0)
+
+
 def test_history_omits_power_when_worker_does_not_report(
     state: CoordinatorState, tmp_path: Path
 ) -> None:

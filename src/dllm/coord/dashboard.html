@@ -165,6 +165,22 @@
     </table>
   </div>
 
+  <h2>active workers</h2>
+  <div class="card" style="padding:0">
+    <table>
+      <thead><tr>
+        <th>id</th><th>country</th><th>gpu</th>
+        <th class="num">rounds in</th>
+        <th class="num">last round</th>
+        <th class="num">last power</th>
+        <th class="num">last tok/s</th>
+        <th class="num">last val</th>
+        <th>last seen</th>
+      </tr></thead>
+      <tbody id="workers"><tr><td colspan="9" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
+    </table>
+  </div>
+
   <h2>recent rounds (last 20)</h2>
   <div class="card" style="padding:0">
     <table>
@@ -434,6 +450,60 @@ function drawChart(history) {
 }
 
 // ---------------------------------------------------------------------------
+// Active workers table
+// ---------------------------------------------------------------------------
+function renderWorkersTable(workers, currentRound) {
+  if (!workers.length) {
+    document.getElementById("workers").innerHTML =
+      '<tr><td colspan="9" style="text-align:center;color:var(--muted)">no workers registered</td></tr>';
+    return;
+  }
+  const now = Date.now() / 1000;
+  const rows = workers.map(w => {
+    const lastSeen = w.last_seen_ts;
+    const lastRound = w.last_round;
+    // "Inactive" = registered but has never contributed (last_seen_ts null)
+    // OR last contribution was >3 rounds ago (probably stuck/slow/dropped).
+    let rowStyle = "";
+    let statusBadge = "";
+    if (lastSeen == null) {
+      rowStyle = "color:var(--warn)";
+      statusBadge = " ⚠ never contributed";
+    } else {
+      const roundsBehind = currentRound != null && lastRound != null
+        ? currentRound - lastRound : 0;
+      const stale = (now - lastSeen) > 600;  // 10 min
+      if (roundsBehind > 3 || stale) {
+        rowStyle = "color:var(--warn)";
+        statusBadge = roundsBehind > 3 ? ` ⚠ ${roundsBehind} rounds behind` : " ⚠ stale";
+      }
+    }
+    const lastSeenStr = lastSeen ? fmtAgo(now - lastSeen) : "never";
+    const gpuShort = (w.gpu || "unknown").replace(/^NVIDIA GeForce /, "").slice(0, 24);
+    return `<tr style="${rowStyle}">` +
+      `<td>${w.worker_id}</td>` +
+      `<td>${w.country || "—"}</td>` +
+      `<td title="${w.gpu}">${gpuShort}${w.vram_gb ? ` (${w.vram_gb}G)` : ""}</td>` +
+      `<td class="num">${w.rounds_contributed || 0}</td>` +
+      `<td class="num">${lastRound != null ? lastRound : "—"}</td>` +
+      `<td class="num">${w.last_power_watts != null ? fmtWatts(w.last_power_watts) : "—"}</td>` +
+      `<td class="num">${w.last_tokens_per_sec != null ? fmtTokPerS(w.last_tokens_per_sec) : "—"}</td>` +
+      `<td class="num">${w.last_val_loss != null ? w.last_val_loss.toFixed(4) : "—"}</td>` +
+      `<td>${lastSeenStr}${statusBadge}</td>` +
+      `</tr>`;
+  }).join("");
+  document.getElementById("workers").innerHTML = rows;
+}
+
+function fmtAgo(seconds) {
+  if (seconds < 0) return "just now";
+  if (seconds < 60) return `${Math.round(seconds)}s ago`;
+  if (seconds < 3600) return `${Math.round(seconds/60)}m ago`;
+  if (seconds < 86400) return `${(seconds/3600).toFixed(1)}h ago`;
+  return `${(seconds/86400).toFixed(1)}d ago`;
+}
+
+// ---------------------------------------------------------------------------
 // Round progress bar
 // ---------------------------------------------------------------------------
 function updateRoundProgress(status, m) {
@@ -602,10 +672,21 @@ async function refresh() {
       }
     }
     document.getElementById("power").textContent = fmtWatts(powerVal);
-    const cohortCount = hist.length ? (hist[hist.length-1].n_workers || 1) : 1;
-    document.getElementById("power_sub").textContent = powerVal != null
-      ? `${cohortCount} reporting worker(s) last round`
-      : "no worker has reported power yet";
+    // sub-text uses the authoritative `last_n_reporting_workers` from status
+    // (was n_workers from history, which counts submitting-not-necessarily-
+    // reporting workers — diverged after the cohort-sum bug fix).
+    const nReporting = status.last_n_reporting_workers || 0;
+    const perWorker = status.last_power_watts_per_worker;
+    let powerSub;
+    if (powerVal == null) {
+      powerSub = "no worker has reported power yet";
+    } else if (nReporting <= 1) {
+      powerSub = "1 reporting worker (sole contributor)";
+    } else {
+      powerSub = `${nReporting} reporting workers · sum of per-worker draws` +
+                 (perWorker != null ? ` · avg ${fmtWatts(perWorker)} each` : "");
+    }
+    document.getElementById("power_sub").textContent = powerSub;
 
     const energy = status.energy_wh_total || 0;
     document.getElementById("energy").textContent = fmtEnergy(energy);
@@ -634,6 +715,18 @@ async function refresh() {
     updateRoundProgress(status, m);
 
     drawChart(hist);
+
+    // active workers table — single extra GET parallel to /status + /history.
+    // Surfaces "registered but inactive" so the M5/slow-worker case is
+    // visible at a glance instead of needing a journald grep.
+    try {
+      const workersResp = await fetch("/workers").then(r => r.json());
+      renderWorkersTable(workersResp.workers || [], status.current_round);
+    } catch (e) {
+      // non-fatal: the rest of the dashboard works without this
+      document.getElementById("workers").innerHTML =
+        '<tr><td colspan="9" style="text-align:center;color:var(--muted)">workers endpoint unreachable</td></tr>';
+    }
 
     // recent rounds table
     const rows = hist.slice(-20).reverse().map(r => {

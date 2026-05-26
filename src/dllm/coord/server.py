@@ -118,7 +118,9 @@ class CoordinatorState:
         self.power_watts_per_round: dict[int, list[float]] = {0: []}
         self.tokens_per_sec_per_round: dict[int, list[float]] = {0: []}
         self.last_val_loss: float | None = None
-        self.last_power_watts: float | None = None  # mean of last round's workers
+        self.last_power_watts: float | None = None  # COHORT sum of last round's workers
+        self.last_power_watts_per_worker: float | None = None  # mean for reference
+        self.last_n_reporting_workers: int = 0
         self.last_tokens_per_sec: float | None = None  # sum across last round's workers
         self.flops_total: float = 0.0  # cumulative estimate
         self.energy_wh_total: float = 0.0  # cumulative cohort energy
@@ -378,8 +380,31 @@ class CoordinatorState:
                 min_workers=self.min_workers,
                 energy_wh_total=self.energy_wh_total,
                 last_power_watts=self.last_power_watts,
+                last_power_watts_per_worker=self.last_power_watts_per_worker,
+                last_n_reporting_workers=self.last_n_reporting_workers,
                 last_tokens_per_sec=self.last_tokens_per_sec,
             )
+
+    def list_workers(self) -> list[dict]:
+        """Snapshot per-worker stats for the /workers endpoint + dashboard."""
+        with self.lock:
+            return [
+                {
+                    "worker_id": wid,
+                    "country": w.get("country", "XX"),
+                    "gpu": w.get("gpu", "unknown"),
+                    "vram_gb": w.get("vram_gb", 0),
+                    "ram_gb": w.get("ram_gb", 0),
+                    "registered_at": w.get("registered_at", 0.0),
+                    "rounds_contributed": w.get("rounds_contributed", 0),
+                    "last_seen_ts": w.get("last_seen_ts"),
+                    "last_round": w.get("last_round"),
+                    "last_val_loss": w.get("last_val_loss"),
+                    "last_power_watts": w.get("last_power_watts"),
+                    "last_tokens_per_sec": w.get("last_tokens_per_sec"),
+                }
+                for wid, w in sorted(self.workers.items())
+            ]
 
     def state_blob(self) -> tuple[bytes, int]:
         with self.lock:
@@ -425,6 +450,19 @@ class CoordinatorState:
                 self.power_watts_per_round.setdefault(self.round, []).append(power_watts)
             if tokens_per_sec is not None and tokens_per_sec > 0:
                 self.tokens_per_sec_per_round.setdefault(self.round, []).append(tokens_per_sec)
+            # Per-worker stats — power the dashboard's "active workers" table so
+            # "registered but not contributing" (the classic M5/slow-worker case)
+            # is obvious at a glance instead of requiring a journald grep.
+            ws = self.workers[worker_id]
+            ws["rounds_contributed"] = ws.get("rounds_contributed", 0) + 1
+            ws["last_seen_ts"] = time.time()
+            ws["last_round"] = claimed_round
+            if val_loss is not None:
+                ws["last_val_loss"] = val_loss
+            if power_watts is not None and power_watts > 0:
+                ws["last_power_watts"] = power_watts
+            if tokens_per_sec is not None and tokens_per_sec > 0:
+                ws["last_tokens_per_sec"] = tokens_per_sec
             log.info(
                 "delta round=%d worker=%d (%d/%d)%s%s",
                 self.round,
@@ -464,27 +502,32 @@ class CoordinatorState:
             )
         self.flops_total += self._estimate_round_flops()
 
-        # Cohort power + throughput aggregation. Mean across workers (best
-        # signal of "what one machine in the cohort is drawing"); total tokens/s
-        # is a sum (cohort-wide throughput).
+        # Cohort power + throughput aggregation. Both are SUMS because workers
+        # train simultaneously — cohort instantaneous draw is the sum of each
+        # worker's reported wattage, and cohort throughput is the sum of each
+        # worker's tokens/sec. (The mean is also kept for the dashboard's
+        # "per-worker avg" line.)
         round_powers = self.power_watts_per_round.get(self.round, [])
         round_tok_s = self.tokens_per_sec_per_round.get(self.round, [])
-        mean_power = (sum(round_powers) / len(round_powers)) if round_powers else None
+        n_reporting = len(round_powers)
+        cohort_watts = sum(round_powers) if round_powers else None
+        mean_power = (cohort_watts / n_reporting) if cohort_watts is not None else None
         total_tok_s = sum(round_tok_s) if round_tok_s else None
 
-        # Energy = power * time. Use mean cohort power × world_size as a
-        # proxy for "total cohort wattage", multiplied by the actual round
-        # duration. (Real per-worker integration would need timestamped samples.)
+        # Energy = power * time. Cohort sum × actual round duration is the
+        # right integral: all workers were drawing in parallel for that span.
         round_seconds = max(0.0, time.time() - self.round_started_at)
-        if mean_power is not None and round_seconds > 0:
-            # Scale by number of workers that actually reported so we don't
-            # double-count when world_size > submitting workers.
-            n_reporting = len(round_powers)
-            cohort_watts = mean_power * n_reporting
+        if cohort_watts is not None and round_seconds > 0:
             self.energy_wh_total += cohort_watts * (round_seconds / 3600.0)
 
-        self.last_power_watts = mean_power
+        # `last_power_watts` semantic = cohort sum (matches the dashboard's
+        # "POWER DRAW (COHORT)" tile label). The per-worker mean is exposed
+        # separately on /status so the dashboard can also show "x W avg per
+        # worker" as a tooltip / sub-line.
+        self.last_power_watts = cohort_watts
+        self.last_power_watts_per_worker = mean_power
         self.last_tokens_per_sec = total_tok_s
+        self.last_n_reporting_workers = n_reporting
 
         prev_round = self.round
         self.round += 1
@@ -507,10 +550,13 @@ class CoordinatorState:
                 "flops_total": self.flops_total,
                 "ts": time.time(),
                 "round_seconds": round_seconds,
-                "power_watts": mean_power,
+                # Cohort sum (matches the "POWER DRAW (COHORT)" tile).
+                "power_watts": cohort_watts,
+                "power_watts_per_worker": mean_power,
                 "tokens_per_sec": total_tok_s,
                 "energy_wh_total": self.energy_wh_total,
                 "n_workers": len(round_deltas),
+                "n_reporting_workers": n_reporting,
             }
         )
 
@@ -582,6 +628,10 @@ def create_app(state: CoordinatorState) -> FastAPI:
     def get_history() -> dict:
         with state.lock:
             return {"history": list(state.history)}
+
+    @app.get("/workers")
+    def get_workers() -> dict:
+        return {"workers": state.list_workers()}
 
     @app.post("/register", response_model=RegisterResponse)
     def register(req: RegisterRequest) -> RegisterResponse:
