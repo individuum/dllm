@@ -145,6 +145,36 @@ The token / BPE / shard format is identical to v1 — only the *content* of
 become incompatible (vocab IDs shift), so plan a fresh training run when
 swapping in the new corpus.
 
+## Data prep speedup: parallelize both stages (2026-05-26)
+
+The v3 corpus (~5.5 B tokens) initially took **6 hours** on a 32-core box —
+~240 k tok/s, one core active. Two cumulative fixes brought it to **~30-60 min**.
+
+**Fix 1: batched + threaded tokenization.** The naive
+`for doc in stream: tokenizer.encode(doc)` loop pinned the `tokenizers`
+Rust impl to one thread regardless of CPU count: Python held the GIL
+between encode calls and the Rayon thread pool couldn't parallelize across
+docs. Replaced with `tokenizer.encode_batch(batch, batch_size=256)` which
+releases the GIL and uses all Rayon threads. Throughput jumped to ~350 k tok/s
+but the bottleneck shifted to the producer.
+
+**Fix 2: parallel HF producers.** PleIAs books are ~33 k tokens/doc, ~100 ms
+each from one HTTP stream → producer fed only ~10 docs/sec, tokenizer idle
+95 %. Refactored `tokenize_streaming` to spawn one Python thread per
+(source, lang) pair (~25 for v3). GIL releases during socket I/O so they
+download concurrently. Throughput ~750 k tok/s, ETA ~2 hours.
+
+**Operator notes:**
+- `--reuse-tokenizer` flag skips Phase 1+2 (BPE training) on re-runs; the
+  tokenizer.json on disk is reused as-is.
+- Set `RAYON_NUM_THREADS=N` to cap Rust thread pool (default = all cores).
+- Tokenization batch size: `--tokenize-batch-size 256` (default). Larger =
+  more memory, more GIL release per batch; smaller = lower latency.
+
+**Remaining bottleneck:** network bandwidth (sum of 25 HF streams). To go
+below ~30 min, pre-download parquet files to local disk first and switch
+streaming=False. Not done yet.
+
 ## Pointers
 
 - Architecture + roadmap: [PLAN.md](PLAN.md) (Phase 0/1/2, EU compliance, tier-aware scheduling).
