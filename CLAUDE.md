@@ -75,6 +75,33 @@ The coord's dereg timeout is shorter than that, so a sole M5 worker can't ever c
 
 Either fix alone unblocks M5; both together make the system robust to similar imbalances at other tiers.
 
+## Observed: per-worker val_loss skew across heterogeneous cohort (2026-05-26)
+
+After flipping `--world-size=2` and getting both 3060 + M5 contributing, dashboard val
+jumped 4.55 → 5.49. Not a regression of the consensus model — an averaging artifact:
+
+| round | 3060 val | M5 val | mean reported |
+|---|---|---|---|
+| 135 | 4.67 | 6.68 | **5.67** |
+| 136 | 4.59 | 6.39 | **5.49** |
+| 137 | 4.51 | (pending) | — |
+
+M5 joined at round 135 and is doing its first long inner loops on a stale local model
+(it pulled state once at join and hasn't resynced since). Its per-worker val reflects
+*its own local θ*, not the consensus θ that the outer step produces. The outer step
+averages **gradients** not losses, so the post-step cohort model's true val is close to
+the 3060's number (~4.5), not the reported mean (5.49).
+
+`last_val_loss` on `/status` is `mean(worker val_losses)` and is therefore misleading
+in a heterogeneous cohort where workers' local θ diverge. The new dashboard's "active
+workers" table surfaces per-worker val_loss so this is visible at a glance.
+
+Better fixes (in priority order):
+1. Coord runs val on the consensus model itself after each outer step — slow on CPU
+   container but truthful. ~10× simpler than weighting schemes.
+2. Weight `last_val_loss` by how recently each worker resynced its `last_ref`.
+3. Display only the freshest worker's val (the one whose `last_round` == `current_round-1`).
+
 ## Pointers
 
 - Architecture + roadmap: [PLAN.md](PLAN.md) (Phase 0/1/2, EU compliance, tier-aware scheduling).
