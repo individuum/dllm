@@ -365,12 +365,20 @@ class Worker:
             )
         if self.val_loader is None and self.val_data is not None and self.val_data.exists():
             try:
+                # val is NOT partitioned by worker_id — every worker validates
+                # against the full val.bin. Was a bug: with world_size > 1 each
+                # worker got a different EU-language slice from val.bin so
+                # per-worker val_losses lived on different distributions
+                # (Polish perplexity ≠ German perplexity even at consensus θ).
+                # The averaged last_val_loss then jumped when a new worker
+                # joined even if the consensus model was unchanged.
+                # See CLAUDE.md "val_loss skew" section.
                 self.val_loader = ShardLoader(
                     self.val_data,
                     seq_len=self.seq_len,
                     batch_size=self.micro_batch_size,
-                    worker_id=self.worker_id,
-                    world_size=self.world_size,
+                    worker_id=0,
+                    world_size=1,
                     device=self.device,
                     seed=self.seed + 10_000,  # different stream from train
                 )

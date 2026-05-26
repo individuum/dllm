@@ -96,11 +96,22 @@ the 3060's number (~4.5), not the reported mean (5.49).
 in a heterogeneous cohort where workers' local θ diverge. The new dashboard's "active
 workers" table surfaces per-worker val_loss so this is visible at a glance.
 
-Better fixes (in priority order):
+**Root cause was actually deeper:** `ShardLoader` partitioned `val.bin` by
+`worker_id % world_size`. With world_size=2 the M5 was validating on the *second
+half* of val.bin — a different EU language slice than the 3060 was using. Per-token
+entropy varies meaningfully across the de/fr/es/it/en/nl/pl languages, so worker
+val_losses live on different distributions and aren't comparable. Fixed by hard-coding
+`val_loader = ShardLoader(val.bin, worker_id=0, world_size=1)` in the worker — every
+worker now validates against the full val.bin. Test: `test_worker_val_loader_spans_full_file_regardless_of_world_size`.
+
+After the val-shard fix lands, both workers' val should land within noise (~±0.1) of
+each other and the averaged `last_val_loss` becomes a meaningful cohort signal again.
+
+Future improvements:
 1. Coord runs val on the consensus model itself after each outer step — slow on CPU
    container but truthful. ~10× simpler than weighting schemes.
-2. Weight `last_val_loss` by how recently each worker resynced its `last_ref`.
-3. Display only the freshest worker's val (the one whose `last_round` == `current_round-1`).
+2. Weight `last_val_loss` by how recently each worker resynced its `last_ref` (still
+   matters for the per-round drift artifact even with shared val).
 
 ## Pointers
 
