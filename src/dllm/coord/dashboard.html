@@ -45,11 +45,29 @@
                   border-radius: 8px; padding: 1rem; }
     svg { width: 100%; height: 320px; display: block; }
     .tabs { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: 1rem; }
+    .tabs-secondary { margin-top: -.5rem; margin-bottom: 1rem; opacity: .85; }
+    .tabs-secondary .tab { padding: .2rem .6rem; font-size: .75rem; }
     .tab { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
            border-radius: 6px; padding: .35rem .8rem; font-size: .85rem;
            cursor: pointer; font-family: inherit; transition: all .15s; }
     .tab:hover { border-color: var(--accent); }
     .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+    /* chart hover tooltip */
+    .chart-host { position: relative; }
+    .chart-tooltip {
+      position: absolute; pointer-events: none; z-index: 10;
+      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+      padding: .5rem .7rem; font-size: .8rem; line-height: 1.5;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, .3);
+      font-variant-numeric: tabular-nums; min-width: 12rem;
+      transition: opacity .1s; opacity: 0;
+    }
+    .chart-tooltip.visible { opacity: 1; }
+    .chart-tooltip .tt-round { font-weight: 600; color: var(--accent);
+                               margin-bottom: .25rem; }
+    .chart-tooltip .tt-row { display: flex; justify-content: space-between;
+                             gap: 1rem; }
+    .chart-tooltip .tt-row .label { color: var(--muted); }
     .footer { color: var(--muted); font-size: .8rem; margin-top: 2rem;
               padding-top: 1rem; border-top: 1px solid var(--border); }
     code { font-family: ui-monospace, Menlo, monospace; font-size: .85em;
@@ -166,7 +184,11 @@
   <h2>training metric over rounds</h2>
   <div class="chart-wrap">
     <div class="tabs" id="metricTabs"></div>
-    <svg id="chart" viewBox="0 0 1200 320" preserveAspectRatio="none"></svg>
+    <div class="tabs tabs-secondary" id="rangeTabs"></div>
+    <div class="chart-host">
+      <svg id="chart" viewBox="0 0 1200 320" preserveAspectRatio="none"></svg>
+      <div id="chartTooltip" class="chart-tooltip" style="display:none"></div>
+    </div>
   </div>
 
   <h2>current round</h2>
@@ -333,6 +355,18 @@ const METRICS = {
 };
 
 let currentMetric = "val_loss";
+// Number of recent rounds the chart shows. null = all. Helps see recent
+// variation when an early outlier (round 0 perplexity = 8000+) compresses
+// the y-axis flat for the rest of the run.
+let currentRangeWindow = null;
+const RANGE_OPTIONS = [
+  { label: "all rounds", value: null },
+  { label: "last 500", value: 500 },
+  { label: "last 200", value: 200 },
+  { label: "last 100", value: 100 },
+  { label: "last 50", value: 50 },
+  { label: "last 20", value: 20 },
+];
 
 function buildTabs() {
   const tabs = document.getElementById("metricTabs");
@@ -344,6 +378,24 @@ function buildTabs() {
       currentMetric = btn.dataset.metric;
       tabs.querySelectorAll(".tab").forEach(b =>
         b.classList.toggle("active", b.dataset.metric === currentMetric));
+      if (window._lastHistory) drawChart(window._lastHistory);
+    });
+  });
+}
+
+function buildRangeTabs() {
+  const tabs = document.getElementById("rangeTabs");
+  tabs.innerHTML = RANGE_OPTIONS.map(o => {
+    const dv = o.value === null ? "" : String(o.value);
+    const active = o.value === currentRangeWindow ? "active" : "";
+    return `<button class="tab ${active}" data-window="${dv}">${o.label}</button>`;
+  }).join("");
+  tabs.querySelectorAll(".tab").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const v = btn.dataset.window;
+      currentRangeWindow = v === "" ? null : Number(v);
+      tabs.querySelectorAll(".tab").forEach(b =>
+        b.classList.toggle("active", (b.dataset.window || "") === (v || "")));
       if (window._lastHistory) drawChart(window._lastHistory);
     });
   });
@@ -420,22 +472,29 @@ function computeMetrics(hist) {
 }
 
 // ---------------------------------------------------------------------------
-// Chart drawing (single-series; series chosen by currentMetric)
+// Chart drawing (single-series; series chosen by currentMetric, range slice
+// chosen by currentRangeWindow). Auto-rescales y-axis to the visible window
+// so an early-training outlier (e.g. round 0 perplexity = 8000+) doesn't
+// flatten the rest of the chart against the floor.
 // ---------------------------------------------------------------------------
 function drawChart(history) {
   const svg = document.getElementById("chart");
   const metric = METRICS[currentMetric];
-  const histArr = history || [];
-  // Build points: only entries where the metric is defined
+  let histArr = history || [];
+  if (currentRangeWindow && currentRangeWindow > 0) {
+    histArr = histArr.slice(-currentRangeWindow);
+  }
+  // Build points + retain the full row for tooltip use
   const pts = [];
   for (let i = 0; i < histArr.length; i++) {
     const y = metric.extract(histArr[i], i, histArr);
     if (y != null && Number.isFinite(y)) {
-      pts.push({ round: histArr[i].round, y });
+      pts.push({ round: histArr[i].round, y, row: histArr[i] });
     }
   }
   if (pts.length < 2) {
-    svg.innerHTML = `<text x="600" y="160" text-anchor="middle" fill="#999" font-size="14">need ≥2 rounds with ${metric.label} — currently ${pts.length}</text>`;
+    svg.innerHTML = `<text x="600" y="160" text-anchor="middle" fill="#999" font-size="14">need ≥2 rounds with ${metric.label} in window — currently ${pts.length}</text>`;
+    document.getElementById("chartTooltip").style.display = "none";
     return;
   }
   const w = 1200, h = 320, padL = 80, padR = 20, padT = 20, padB = 40;
@@ -443,7 +502,11 @@ function drawChart(history) {
   const ys = pts.map(p => p.y);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   let minY = Math.min(...ys), maxY = Math.max(...ys);
-  if (minY === maxY) { minY -= 1; maxY += 1; }  // avoid zero range
+  if (minY === maxY) { minY -= 1; maxY += 1; }
+  // 5% headroom on both ends so the line doesn't graze the bounding box
+  const yPad = (maxY - minY) * 0.05;
+  minY -= yPad; maxY += yPad;
+
   const xS = x => padL + (x - minX) / Math.max(1, maxX - minX) * (w - padL - padR);
   const yS = y => padT + (1 - (y - minY) / Math.max(1e-9, maxY - minY)) * (h - padT - padB);
   const points = pts.map(p => `${xS(p.round)},${yS(p.y)}`).join(" ");
@@ -460,7 +523,94 @@ function drawChart(history) {
   const last = pts[pts.length - 1];
   html += `<circle cx="${xS(last.round)}" cy="${yS(last.y)}" r="4" fill="var(--series)"/>`;
   html += `<text x="${xS(last.round) - 8}" y="${yS(last.y) - 8}" text-anchor="end" font-size="12" font-weight="600" fill="var(--series)">${metric.fmt(last.y)}</text>`;
+  // Hover crosshair: empty group the mousemove handler fills in
+  html += `<g id="chartCrosshair"></g>`;
   svg.innerHTML = html;
+  // Wire (or re-wire) the hover tooltip against this rendering
+  setupChartHover(pts, xS, yS, padL, padR, w, h, metric);
+}
+
+function setupChartHover(pts, xS, yS, padL, padR, w, h, metric) {
+  const svg = document.getElementById("chart");
+  const tooltip = document.getElementById("chartTooltip");
+  if (!pts.length) {
+    tooltip.style.display = "none";
+    return;
+  }
+  // Detach any prior listeners by re-assigning the on* properties
+  svg.onmousemove = (e) => {
+    const rect = svg.getBoundingClientRect();
+    if (rect.width === 0) return;
+    const fracX = (e.clientX - rect.left) / rect.width;
+    const vbX = fracX * w;
+    if (vbX < padL - 5 || vbX > w - padR + 5) {
+      tooltip.classList.remove("visible");
+      document.getElementById("chartCrosshair").innerHTML = "";
+      return;
+    }
+    // Binary-search would be O(log n); linear is fine for ≤500 points
+    let nearest = pts[0];
+    let minDist = Infinity;
+    for (const p of pts) {
+      const d = Math.abs(xS(p.round) - vbX);
+      if (d < minDist) { minDist = d; nearest = p; }
+    }
+    // Draw crosshair (vertical line + emphasized dot)
+    const cx = xS(nearest.round), cy = yS(nearest.y);
+    document.getElementById("chartCrosshair").innerHTML =
+      `<line x1="${cx}" x2="${cx}" y1="${20}" y2="${h - 40}" stroke="var(--muted)" stroke-width=".8" stroke-dasharray="3,3"/>` +
+      `<circle cx="${cx}" cy="${cy}" r="6" fill="none" stroke="var(--series)" stroke-width="2"/>`;
+    // Tooltip content + positioning
+    tooltip.innerHTML = renderTooltipContent(nearest, metric);
+    // Position relative to the chart-host container (the tooltip's offset parent)
+    const host = svg.parentElement;
+    const hostRect = host.getBoundingClientRect();
+    let tx = e.clientX - hostRect.left + 16;
+    let ty = e.clientY - hostRect.top + 16;
+    // Clamp so the tooltip doesn't escape the host on the right edge
+    const tw = tooltip.offsetWidth || 200;
+    if (tx + tw > hostRect.width - 4) tx = e.clientX - hostRect.left - tw - 16;
+    tooltip.style.left = tx + "px";
+    tooltip.style.top = ty + "px";
+    tooltip.style.display = "block";
+    tooltip.classList.add("visible");
+  };
+  svg.onmouseleave = () => {
+    tooltip.classList.remove("visible");
+    setTimeout(() => { if (!tooltip.classList.contains("visible")) tooltip.style.display = "none"; }, 150);
+    const cross = document.getElementById("chartCrosshair");
+    if (cross) cross.innerHTML = "";
+  };
+}
+
+function renderTooltipContent(pt, currentMetricObj) {
+  const r = pt.row;
+  const rows = [`<div class="tt-round">round ${r.round}</div>`];
+  // Always show the currently-selected metric first, in bold
+  rows.push(`<div class="tt-row"><span class="label">${currentMetricObj.label}</span><span><b>${currentMetricObj.fmt(pt.y)}</b></span></div>`);
+  // Then a snapshot of the other useful per-round fields if present
+  if (r.val_loss != null && currentMetric !== "val_loss") {
+    rows.push(`<div class="tt-row"><span class="label">val loss</span><span>${r.val_loss.toFixed(4)}</span></div>`);
+  }
+  if (r.val_loss != null && currentMetric !== "perplexity") {
+    rows.push(`<div class="tt-row"><span class="label">perplexity</span><span>${Math.exp(r.val_loss).toFixed(1)}</span></div>`);
+  }
+  if (r.tokens_per_sec != null && currentMetric !== "tokens_per_sec") {
+    rows.push(`<div class="tt-row"><span class="label">tok/s</span><span>${fmtTokPerS(r.tokens_per_sec)}</span></div>`);
+  }
+  if (r.power_watts != null && currentMetric !== "power_watts") {
+    rows.push(`<div class="tt-row"><span class="label">power</span><span>${fmtWatts(r.power_watts)}</span></div>`);
+  }
+  if (r.round_seconds != null && currentMetric !== "round_seconds") {
+    rows.push(`<div class="tt-row"><span class="label">round dur</span><span>${fmtClock(r.round_seconds)}</span></div>`);
+  }
+  if (r.energy_wh_total != null && currentMetric !== "energy_wh_total") {
+    rows.push(`<div class="tt-row"><span class="label">cum. energy</span><span>${fmtEnergy(r.energy_wh_total)}</span></div>`);
+  }
+  if (r.ts) {
+    rows.push(`<div class="tt-row"><span class="label">at</span><span>${fmtTime(r.ts)}</span></div>`);
+  }
+  return rows.join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +989,7 @@ async function refresh() {
 }
 
 buildTabs();
+buildRangeTabs();
 refresh();
 setInterval(refresh, 5000);
 
