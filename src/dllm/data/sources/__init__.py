@@ -41,6 +41,7 @@ _SOURCE_NAMES = (
     "europarl",
     "jrc_acquis",
     "gutenberg",
+    "pleias_books",
 )
 
 

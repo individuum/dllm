@@ -1,20 +1,26 @@
-"""Project Gutenberg — public-domain literature.
+"""Project Gutenberg — public-domain literature in 5 EU languages.
 
-Status: English-only via `sedthh/gutenberg_english`, which is the
-best-maintained, schema-stable mirror on HF. The multilingual mirrors
-(`manu/project_gutenberg`, etc.) either don't exist, return string-only
-rows, or are English-only despite their name. For non-English literary
-register we currently rely on Wikipedia + EuroParl + (future) OPUS Books.
+Two HF mirrors are used, both schema-stable and parquet-native (no
+script loaders), both MIT-licensed by the same maintainer:
 
-License: Public Domain — works whose copyright has expired or never
-applied. We strip Gutenberg's trademark header/footer so we ship only
-the public-domain body.
+  - `sedthh/gutenberg_english` for English (~48k books).
+  - `sedthh/gutenberg_multilang` for de/fr/it/es (book counts:
+    DE 1735, FR 2863, IT 692, ES 717). Language lives inside a
+    JSON-encoded METADATA column, so we filter row-by-row.
+
+License: MIT on the compilation; underlying texts are Public Domain per
+Project Gutenberg eligibility. The Gutenberg trademark header/footer is
+stripped from each book so we ship only the public-domain body.
 """
 from __future__ import annotations
 
+import json
 from typing import Iterator
 
-_LANGS = ["en"]  # multilingual Gutenberg via HF is brittle; en only for now
+_LANGS = ["en", "de", "fr", "it", "es"]
+_EN_DATASET = "sedthh/gutenberg_english"
+_MULTILANG_DATASET = "sedthh/gutenberg_multilang"
+
 DOC_TARGET_CHARS = 8000  # ~2 k tokens per chunk
 MIN_CHARS = 500
 
@@ -25,16 +31,15 @@ def supported_langs() -> list[str]:
 
 def license_info() -> dict:
     return {
-        "name": "Project Gutenberg (English subset)",
-        "hf_dataset": "sedthh/gutenberg_english",
-        "license": "Public Domain (per Gutenberg eligibility criteria)",
+        "name": "Project Gutenberg",
+        "hf_dataset": f"{_EN_DATASET} (en) + {_MULTILANG_DATASET} (de/fr/it/es)",
+        "license": "MIT (dataset compilation) + Public Domain (underlying texts)",
         "license_url": "https://www.gutenberg.org/policy/permission.html",
         "url": "https://www.gutenberg.org/",
         "attribution": (
             "Public-domain literature from Project Gutenberg. Trademark "
             "header/footer stripped — only the public-domain body is included. "
-            "English-only at present; non-English Gutenberg integration is "
-            "blocked on schema-stable HF mirrors."
+            "Schema-stable parquet mirrors maintained by sedthh, MIT-licensed."
         ),
     }
 
@@ -93,12 +98,31 @@ def _extract_text(row) -> str | None:
         return row
     if not isinstance(row, dict):
         return None
-    # Common field names across Gutenberg mirrors
-    for key in ("text", "TEXT", "content", "body"):
+    for key in ("TEXT", "text", "content", "body"):
         v = row.get(key)
         if isinstance(v, str) and v:
             return v
     return None
+
+
+def _row_lang(row) -> str | None:
+    """Extract the ISO 639-1 language code from a row's METADATA JSON.
+    Returns None if the field is missing or unparseable."""
+    if not isinstance(row, dict):
+        return None
+    meta = row.get("METADATA") or row.get("metadata")
+    if isinstance(meta, dict):
+        lang = meta.get("language")
+    elif isinstance(meta, str):
+        try:
+            lang = json.loads(meta).get("language")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+    else:
+        return None
+    if not isinstance(lang, str):
+        return None
+    return lang.strip().lower()[:2] or None
 
 
 def iter_docs(lang: str, char_budget: int) -> Iterator[str]:
@@ -107,11 +131,19 @@ def iter_docs(lang: str, char_budget: int) -> Iterator[str]:
     if lang not in _LANGS:
         return
 
-    ds = load_dataset("sedthh/gutenberg_english", split="train", streaming=True)
+    if lang == "en":
+        ds = load_dataset(_EN_DATASET, split="train", streaming=True)
+        lang_filter = None  # the English mirror is already monolingual
+    else:
+        ds = load_dataset(_MULTILANG_DATASET, split="train", streaming=True)
+        lang_filter = lang
+
     emitted = 0
     for row in ds:
         if emitted >= char_budget:
             return
+        if lang_filter is not None and _row_lang(row) != lang_filter:
+            continue
         raw = _extract_text(row)
         if not raw:
             continue

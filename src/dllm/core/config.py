@@ -59,6 +59,17 @@ PRESETS: dict[str, ModelConfig] = {
         n_kv_heads=4,
         max_seq_len=1024,
     ),
+    # ~300M, GPT-2-medium class — sweet spot for an 11.7 GB consumer
+    # GPU (3060 / 4060 Ti 16G / 4070): model state ~4.8 GB, activations
+    # ~5 GB at batch=4 seq=512 bf16, total ~10 GB with comfortable
+    # headroom. Roughly Chinchilla-optimal for our ~5 B-token corpus.
+    "300M": ModelConfig(
+        dim=1024,
+        n_layers=24,
+        n_heads=16,
+        n_kv_heads=4,
+        max_seq_len=1024,
+    ),
     # ~1B, Phase 1 target
     "1B": ModelConfig(
         dim=2048,

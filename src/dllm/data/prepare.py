@@ -46,23 +46,26 @@ DEFAULT_VOCAB = 32768
 DEFAULT_VAL_TOKENS = 50_000_000  # 50 M val tokens (~1 % of train); enough for stable val
 EOT_TOKEN = "<|endoftext|>"
 
-# Per-source per-lang CHARACTER budgets. Token estimate ≈ chars × 0.25 for
-# European langs; totals below sum to ~19 B chars ≈ 4.75 B tokens budget.
-# Operators can override any cell via the --alloc JSON.
+# v3 corpus design (2026-05-26): adds PleIAs per-language Public-Domain
+# Books (DE/FR/IT/ES) to fill the literary register gap for non-English
+# languages — these are purpose-built for EU AI Act Article 53 compliance.
+# Gutenberg now also covers de/fr/it/es via sedthh/gutenberg_multilang, but
+# PleIAs is much larger so it does the heavy lifting for non-EN literature.
 #
-# Notes on what we *don't* include in the default:
-#   - JRC-Acquis: was 0.6 B chars across 5 langs. The HF `multi_eurlex`
-#     loader is now script-based and blocked in modern `datasets` versions.
-#     Budget reallocated to EuroParl (same EU-institutional register,
-#     working schema). To re-enable JRC, find a parquet-based mirror.
-#   - Gutenberg de/fr/it/es: schema-stable HF mirrors don't exist for
-#     non-English. Budget reallocated to Wikipedia + EuroParl.
+# Per-source per-lang CHARACTER budgets. Token estimate ≈ chars × 0.25 for
+# European langs; totals sum to ~20 B chars ≈ 5 B tokens budget.
+# Operators can override any cell via the --alloc JSON.
 DEFAULT_ALLOC_CHARS = {
-    "wikipedia":  {"de": 3_200_000_000, "fr": 3_200_000_000, "en": 3_200_000_000,
-                   "it": 3_200_000_000, "es": 3_200_000_000},
-    "gutenberg":  {"en": 1_600_000_000},
-    "europarl":   {"de":   400_000_000, "fr":   400_000_000, "en":   400_000_000,
-                   "it":   400_000_000, "es":   400_000_000},
+    "wikipedia":    {"de": 2_000_000_000, "fr": 2_000_000_000, "en": 2_500_000_000,
+                     "it": 2_000_000_000, "es": 2_000_000_000},
+    "pleias_books": {"de": 2_000_000_000, "fr": 2_000_000_000,
+                     "it": 1_500_000_000, "es": 1_500_000_000},
+    "gutenberg":    {"en": 1_500_000_000, "de":   400_000_000, "fr":   400_000_000,
+                     "it":   400_000_000, "es":   400_000_000},
+    "europarl":     {"de":   200_000_000, "fr":   200_000_000, "en":   200_000_000,
+                     "it":   200_000_000, "es":   200_000_000},
+    "jrc_acquis":   {"de":   120_000_000, "fr":   120_000_000, "en":   120_000_000,
+                     "it":   120_000_000, "es":   120_000_000},
 }
 
 # How many CHARS to sample per (source, lang) into the BPE training mix.

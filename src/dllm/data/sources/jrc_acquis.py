@@ -1,23 +1,34 @@
-"""JRC-Acquis — EU law in 22 official languages, parallel corpus.
+"""JRC-Acquis / EUR-Lex — EU legislative text in all 5 target languages.
 
-The Acquis Communautaire is the body of EU law (treaties, regulations,
-directives, decisions) compiled by the JRC. Excellent for teaching the
+Provides the body of EU legal acts (commission decisions, regulations,
+directives, etc.) compiled from EUR-Lex. Excellent for teaching the
 model EU legal/administrative register, which generalizes well to policy,
 contracts, and formal writing.
 
-License: Public domain (EU institutional content under Council Decision
-2011/833/EU).
+HF dataset: `mteb/eurlex-multilingual` — a parquet-converted mirror
+maintained by the MTEB benchmark. We use this instead of the original
+`multi_eurlex` (and its forks: coastalcph, Muennighoff, joelniklaus)
+because every one of those still ships a `multi_eurlex.py` loading
+script, which the modern `datasets` library (>=2.20) refuses to execute
+even with `trust_remote_code=True`. The mteb mirror has the same
+content (~65k EU laws, train/val/test split, CELEX IDs) in flat parquet.
 
-HF dataset: `multi_eurlex` (a superset that re-hosts JRC-Acquis style
-documents from EUR-Lex) is the most reliable mirror. Each document is a
-full legal act with a CELEX identifier; we yield the article-body text.
+License: The underlying EU legislative text is **public domain** under
+Council Decision 2011/833/EU (the EU's open data policy). The mteb
+mirror itself is **CC-BY-SA-4.0**, matching our Wikipedia source —
+attribution to mteb + URL is preserved in `license_info()` and lands in
+the corpus manifest.
+
+Row schema: `{"id": str, "text": str, "label": list[int]}`. We only
+consume `text` — labels are EUROVOC classification IDs, irrelevant for
+pre-training.
 """
 from __future__ import annotations
 
 from typing import Iterator
 
 _LANGS = ["de", "fr", "en", "it", "es"]
-MIN_CHARS = 500  # skip tiny entries
+MIN_CHARS = 500  # skip tiny entries (boilerplate-only acts)
 
 
 def supported_langs() -> list[str]:
@@ -26,14 +37,18 @@ def supported_langs() -> list[str]:
 
 def license_info() -> dict:
     return {
-        "name": "JRC-Acquis (via multi_eurlex)",
-        "hf_dataset": "multi_eurlex",
-        "license": "Public Domain (Council Decision 2011/833/EU)",
+        "name": "JRC-Acquis / EUR-Lex (via mteb/eurlex-multilingual)",
+        "hf_dataset": "mteb/eurlex-multilingual",
+        "license": (
+            "CC-BY-SA-4.0 (mteb mirror); underlying EU legislative content "
+            "is public domain per Council Decision 2011/833/EU"
+        ),
         "license_url": "https://eur-lex.europa.eu/eli/dec/2011/833/oj",
-        "url": "https://eur-lex.europa.eu/",
+        "url": "https://huggingface.co/datasets/mteb/eurlex-multilingual",
         "attribution": (
-            "EU legal acts from EUR-Lex / JRC-Acquis. EU institutional content; "
-            "free reuse permitted by EU open data policy."
+            "EU legal acts from EUR-Lex, mirrored by the MTEB benchmark as a "
+            "parquet-converted variant of `multi_eurlex`. EU institutional "
+            "content; free reuse permitted by EU open data policy."
         ),
     }
 
@@ -43,25 +58,13 @@ def iter_docs(lang: str, char_budget: int) -> Iterator[str]:
 
     if lang not in _LANGS:
         return
-    # multi_eurlex uses ISO 639-1 lang codes as config names
-    try:
-        ds = load_dataset("multi_eurlex", lang, split="train", streaming=True)
-    except (ValueError, KeyError):
-        # Older revisions name the config "all_languages" with per-row lang
-        # filtering; this is the fallback path.
-        ds = load_dataset("multi_eurlex", "all_languages", split="train", streaming=True)
+    ds = load_dataset("mteb/eurlex-multilingual", lang, split="train", streaming=True)
 
     emitted = 0
     for row in ds:
         if emitted >= char_budget:
             return
-        # Row schema (lang-specific cfg): {"text": "...", "labels": [...]}
-        # Row schema (all_languages cfg): {"text": {"de": "...", ...}}
-        text_field = row.get("text")
-        if isinstance(text_field, dict):
-            text = (text_field.get(lang) or "").strip()
-        else:
-            text = (text_field or "").strip()
+        text = (row.get("text") or "").strip()
         if len(text) < MIN_CHARS:
             continue
         remaining = char_budget - emitted

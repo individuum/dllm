@@ -244,6 +244,37 @@ def test_every_source_advertises_license_metadata() -> None:
         assert len(src.supported_langs()) > 0
 
 
+def test_gutenberg_supports_all_5_eu_target_langs() -> None:
+    """Gutenberg must cover en/de/fr/it/es — English via sedthh/gutenberg_english,
+    the other four via sedthh/gutenberg_multilang. Catches regressions where
+    a non-English mirror is dropped and silently re-narrows the corpus to en-only.
+    """
+    from dllm.data import sources
+
+    target = {"en", "de", "fr", "it", "es"}
+    supported = set(sources.load("gutenberg").supported_langs())
+    missing = target - supported
+    assert not missing, f"gutenberg dropped literary register for {missing}"
+
+
+def test_every_target_lang_has_at_least_one_literary_source() -> None:
+    """The non-encyclopedic, non-legislative register (i.e. literary text) is
+    served by gutenberg + pleias_books. Each EU target lang must be covered
+    by at least one of them — pleias_books is non-EN only by design, gutenberg
+    now covers all five."""
+    from dllm.data import sources
+
+    literary_sources = ("gutenberg", "pleias_books")
+    target = {"en", "de", "fr", "it", "es"}
+    covered: dict[str, list[str]] = {lang: [] for lang in target}
+    for name in literary_sources:
+        for lang in sources.load(name).supported_langs():
+            if lang in covered:
+                covered[lang].append(name)
+    uncovered = [lang for lang, srcs in covered.items() if not srcs]
+    assert not uncovered, f"no literary source for langs: {uncovered}"
+
+
 def test_default_allocation_is_internally_consistent() -> None:
     """Every (source, lang) in DEFAULT_ALLOC_CHARS must be one the source supports.
     Partial-coverage sources (Gutenberg en-only) must NOT list de/fr/it/es."""
