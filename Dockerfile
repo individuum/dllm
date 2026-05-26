@@ -23,9 +23,9 @@ ENTRYPOINT ["dllm-coord"]
 CMD [ \
     "--host", "0.0.0.0", \
     "--port", "8000", \
-    "--preset", "124M", \
+    "--preset", "300M", \
     "--world-size", "1", \
-    "--inner-steps", "2000", \
+    "--inner-steps", "1500", \
     "--seq-len", "512", \
     "--micro-batch-size", "4", \
     "--checkpoint-dir", "/data/checkpoints", \
