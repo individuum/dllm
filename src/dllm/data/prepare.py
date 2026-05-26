@@ -21,12 +21,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+
+# Force-enable tokenizer multithreading BEFORE any tokenizers/datasets import.
+# HuggingFace's `datasets` library auto-sets TOKENIZERS_PARALLELISM=false when
+# it detects threading/forking, which silently single-threads encode_batch
+# regardless of RAYON_NUM_THREADS. This is the difference between ~750 k tok/s
+# (one core active) and multi-core throughput. Operators can still override
+# by setting the env var explicitly before invoking the script.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
 from . import sources
 
