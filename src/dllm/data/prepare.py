@@ -237,26 +237,78 @@ class ShardWriter:
         return self._total
 
 
+def _parallel_producers(
+    alloc: dict[str, dict[str, int]],
+    langs: list[str],
+    out_q,
+    sentinel,
+) -> list:
+    """Spawn one Python thread per (source, lang) pair so HF fetches run
+    in parallel. Each thread pushes (src_name, lang, doc) into `out_q` and
+    pushes `sentinel` when its iterator exhausts. Caller counts the
+    sentinels to know when all producers are done.
+    """
+    import threading
+
+    pairs: list[tuple[str, str, int]] = []
+    for src_name, lang_budgets in alloc.items():
+        try:
+            src = sources.load(src_name)
+        except ValueError:
+            continue
+        for lang, budget in lang_budgets.items():
+            if lang not in langs:
+                continue
+            if lang not in src.supported_langs():
+                continue
+            if budget <= 0:
+                continue
+            pairs.append((src_name, lang, budget))
+
+    def fetch(src_name: str, lang: str, budget: int) -> None:
+        try:
+            src = sources.load(src_name)
+            for doc in src.iter_docs(lang, budget):
+                out_q.put((src_name, lang, doc))
+        except Exception as e:  # noqa: BLE001
+            print(f"    [warn] fetcher {src_name}/{lang} died: {e}")
+        finally:
+            out_q.put(sentinel)
+
+    threads: list[threading.Thread] = []
+    for src_name, lang, budget in pairs:
+        t = threading.Thread(
+            target=fetch,
+            args=(src_name, lang, budget),
+            daemon=True,
+            name=f"fetch-{src_name}-{lang}",
+        )
+        t.start()
+        threads.append(t)
+    return threads
+
+
 def tokenize_streaming(
-    docs: Iterator[tuple[str, str, str]],
+    docs: Iterator[tuple[str, str, str]] | None,
     tokenizer,
     out_path: Path,
     batch_size: int = 256,
-    queue_size: int = 8,
+    queue_size: int = 64,
+    alloc: dict[str, dict[str, int]] | None = None,
+    langs: list[str] | None = None,
 ) -> tuple[int, dict[tuple[str, str], int]]:
     """Stream-tokenize every doc and append uint16 IDs to out_path.
 
-    Pipelined: a background thread pulls docs from the HF streaming iterator
-    and accumulates them into batches; the main thread consumes batches and
-    invokes `tokenizer.encode_batch(...)`, which the `tokenizers` Rust impl
-    multi-threads across all available CPU cores (via Rayon). The two phases
-    overlap, so we're rarely either I/O-bound or CPU-bound — usually both
-    at the same time.
+    Two modes:
+      - If `alloc` + `langs` are provided: spawns one parallel producer
+        thread per (source, lang) pair. HF downloads run concurrently,
+        which is critical when individual docs are big (PleIAs books =
+        ~33 k tokens / doc, ~100 ms each on one HTTP connection).
+      - Else: falls back to consuming the single iterator `docs` on one
+        producer thread (the original behaviour, used by tests).
 
-    Empirically on a 32-core Windows box this gives ~10× speedup over the
-    naive `for doc: tokenizer.encode(doc)` Python loop, which was capped at
-    one Rust thread because the Python interpreter held the GIL between
-    encode calls.
+    Tokenization itself is always `tokenizer.encode_batch(...)`, which the
+    `tokenizers` Rust impl multi-threads across all Rayon-available cores.
 
     Returns (total_tokens, per_(source,lang)_token_count).
     """
@@ -273,28 +325,51 @@ def tokenize_streaming(
     last_print = 0
 
     SENTINEL = object()
-    q: _queue.Queue = _queue.Queue(maxsize=queue_size)
+    # Doc queue holds (src, lang, doc); collector batches these for the tokenizer.
+    doc_q: _queue.Queue = _queue.Queue(maxsize=queue_size * batch_size)
+    batch_q: _queue.Queue = _queue.Queue(maxsize=queue_size)
 
-    def producer() -> None:
+    if alloc is not None and langs is not None:
+        producer_threads = _parallel_producers(alloc, langs, doc_q, SENTINEL)
+        n_producers = len(producer_threads)
+    else:
+        # Single-iterator fallback (used by tests / non-default callers).
+        def fallback_producer() -> None:
+            assert docs is not None
+            for item in docs:
+                doc_q.put(item)
+            doc_q.put(SENTINEL)
+        t = threading.Thread(target=fallback_producer, daemon=True)
+        t.start()
+        producer_threads = [t]
+        n_producers = 1
+
+    def collector() -> None:
+        """Pull (src, lang, doc) from doc_q, batch them, push to batch_q.
+        Single-threaded so batch ordering is deterministic."""
         batch_docs: list[str] = []
         batch_meta: list[tuple[str, str]] = []
-        try:
-            for src_name, lang, doc in docs:
-                batch_docs.append(doc)
-                batch_meta.append((src_name, lang))
-                if len(batch_docs) >= batch_size:
-                    q.put((batch_docs, batch_meta))
-                    batch_docs, batch_meta = [], []
-            if batch_docs:
-                q.put((batch_docs, batch_meta))
-        finally:
-            q.put(SENTINEL)
+        sentinels_seen = 0
+        while sentinels_seen < n_producers:
+            item = doc_q.get()
+            if item is SENTINEL:
+                sentinels_seen += 1
+                continue
+            src_name, lang, doc = item
+            batch_docs.append(doc)
+            batch_meta.append((src_name, lang))
+            if len(batch_docs) >= batch_size:
+                batch_q.put((batch_docs, batch_meta))
+                batch_docs, batch_meta = [], []
+        if batch_docs:
+            batch_q.put((batch_docs, batch_meta))
+        batch_q.put(SENTINEL)
 
-    t = threading.Thread(target=producer, daemon=True, name="tokenize-producer")
-    t.start()
+    collector_t = threading.Thread(target=collector, daemon=True, name="batch-collector")
+    collector_t.start()
 
     while True:
-        item = q.get()
+        item = batch_q.get()
         if item is SENTINEL:
             break
         batch_docs, batch_meta = item
@@ -312,7 +387,9 @@ def tokenize_streaming(
             )
             last_print = writer._total + writer._idx
 
-    t.join()
+    for t in producer_threads:
+        t.join()
+    collector_t.join()
     total = writer.close()
     return total, counts
 
@@ -553,9 +630,16 @@ def main() -> None:
         train_path.unlink()
     if val_path.exists():
         val_path.unlink()
-    docs = stream_corpus(alloc, args.langs)
+    # Parallel-producer mode: one HF fetcher thread per (source, lang)
+    # pair so multiple HTTP streams overlap. Critical for PleIAs (long
+    # docs, slow per-doc fetch) and Wikipedia (high doc count).
     total_tokens, per_source_lang = tokenize_streaming(
-        docs, tokenizer, train_path, batch_size=args.tokenize_batch_size
+        docs=None,
+        tokenizer=tokenizer,
+        out_path=train_path,
+        batch_size=args.tokenize_batch_size,
+        alloc=alloc,
+        langs=args.langs,
     )
     print(f"  total tokens written: {total_tokens:,}")
     for (src_name, lang), n in sorted(per_source_lang.items()):
