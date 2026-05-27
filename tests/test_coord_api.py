@@ -93,6 +93,30 @@ def test_state_endpoint_returns_safetensors(client: TestClient) -> None:
     assert len(state) > 0
     # at least the embedding should be there
     assert any("tok_emb" in k for k in state)
+    # Legacy (no round param) path: not cache-eligible.
+    assert r.headers.get("Cache-Control") == "no-store"
+
+
+def test_state_endpoint_caches_when_round_param_matches(client: TestClient) -> None:
+    """When the worker passes ?round=N matching the coord's current round,
+    /state returns Cache-Control: immutable so a CDN (Cloudflare) caches
+    each round's state under its own URL forever."""
+    r = client.get("/state?round=0")
+    assert r.status_code == 200
+    cc = r.headers.get("Cache-Control", "")
+    assert "public" in cc
+    assert "immutable" in cc
+    assert "max-age=86400" in cc
+
+
+def test_state_endpoint_returns_409_when_round_mismatch(client: TestClient) -> None:
+    """Worker asked for round 999 but coord is at 0 → 409 + current_round in
+    body so the worker can refresh its view via /status and retry."""
+    r = client.get("/state?round=999")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["current_round"] == 0
+    assert body["requested_round"] == 999
 
 
 def test_delta_rejects_unknown_worker(client: TestClient) -> None:

@@ -964,12 +964,39 @@ def create_app(state: CoordinatorState) -> FastAPI:
         return state.status()
 
     @app.get("/state")
-    def get_state():
+    def get_state(round: int | None = None):
+        # Cache-friendly state endpoint (task #61). When a worker passes
+        # `?round=N`, Cloudflare/CDN treats each round's state as a distinct
+        # URL — `/state?round=89` and `/state?round=90` get separate cache
+        # entries, both immutable for their lifetime. Without the param,
+        # behaviour falls back to legacy "serve whatever the coord has now"
+        # (uncacheable on the CDN side).
         blob, round_no = state.state_blob()
+        headers = {"x-round": str(round_no), "x-codec": state.state_codec}
+        if round is not None:
+            if round != round_no:
+                # Worker asked for state @ round N but coord moved on (or
+                # hasn't reached N yet). Tell them what round we're at; they
+                # should refresh via /status before pulling again.
+                return JSONResponse(
+                    status_code=409,
+                    content={"current_round": round_no, "requested_round": round},
+                    headers={"x-round": str(round_no)},
+                )
+            # Per-round URL is content-addressable. Safe to cache forever
+            # — the bytes for round N never change. Cloudflare's free tier
+            # caches at this header.
+            headers["Cache-Control"] = (
+                "public, max-age=86400, s-maxage=86400, immutable"
+            )
+        else:
+            # Legacy `/state` with no round param. Don't cache — content
+            # depends on coord's current round which moves over time.
+            headers["Cache-Control"] = "no-store"
         return Response(
             content=blob,
             media_type="application/octet-stream",
-            headers={"x-round": str(round_no), "x-codec": state.state_codec},
+            headers=headers,
         )
 
     @app.post("/delta")

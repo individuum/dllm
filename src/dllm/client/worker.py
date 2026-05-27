@@ -450,7 +450,31 @@ class Worker:
             )
 
     def pull_state(self) -> int:
-        r = retry_http(lambda: self.http.get("/state"), label="GET /state (initial)")
+        # Pass the round we believe the coord is at (from /register response)
+        # as a query param so Cloudflare can cache per-round state under a
+        # distinct URL — `/state?round=89` and `/state?round=90` get their
+        # own cache entries, immutable for the round's lifetime. Coord
+        # returns 409 if we're out of sync; we recover by retrying with
+        # the coord-reported current_round.
+        url = f"/state?round={self.current_round}" if self.current_round else "/state"
+        r = retry_http(lambda: self.http.get(url), label="GET /state (initial)")
+        # 409 = round mismatch; coord tells us its current round, retry once.
+        if r.status_code == 409:
+            try:
+                their_round = int(r.json().get("current_round", -1))
+            except Exception:  # noqa: BLE001
+                their_round = -1
+            if their_round >= 0:
+                log.info(
+                    "state-pull round mismatch (we said %d, coord at %d); retrying",
+                    self.current_round,
+                    their_round,
+                )
+                self.current_round = their_round
+                r = retry_http(
+                    lambda: self.http.get(f"/state?round={their_round}"),
+                    label="GET /state (retry after 409)",
+                )
         r.raise_for_status()
         round_no = int(r.headers["x-round"])
         codec = r.headers.get("x-codec", self.state_codec)
@@ -699,8 +723,12 @@ class Worker:
             # we just wasted but keeping the worker contributing.
             next_r = ack.get("next_round")
             if next_r is not None and next_r > round_no:
+                # Per-round URL = Cloudflare-cacheable. The coord just told
+                # us its current round via `next_round`; we ask for that
+                # specific one, immutable forever once written.
                 r2 = retry_http(
-                    lambda: self.http.get("/state"), label="GET /state (resync)"
+                    lambda: self.http.get(f"/state?round={next_r}"),
+                    label="GET /state (resync)",
                 )
                 r2.raise_for_status()
                 codec = r2.headers.get("x-codec", self.state_codec)
@@ -735,11 +763,15 @@ class Worker:
                 rs.raise_for_status()
                 cur = rs.json()["current_round"]
                 if cur > round_no:
+                    target = cur
                     break
                 time.sleep(0.5)
 
+        # By here `target` is the new round we want state for. Per-round URL
+        # so Cloudflare caches each round's state distinctly + forever.
         r2 = retry_http(
-            lambda: self.http.get("/state"), label="GET /state (post-accept)"
+            lambda: self.http.get(f"/state?round={target}"),
+            label="GET /state (post-accept)",
         )
         r2.raise_for_status()
         codec = r2.headers.get("x-codec", self.state_codec)
