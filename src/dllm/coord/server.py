@@ -963,7 +963,11 @@ def create_app(state: CoordinatorState) -> FastAPI:
     def status() -> RoundStatus:
         return state.status()
 
-    @app.get("/state")
+    # api_route w/ GET+HEAD: FastAPI doesn't auto-handle HEAD on @app.get,
+    # so plain HEAD returns 405. Workers probe with HEAD before deciding
+    # to parallel-fetch via Range — we MUST answer it. FastAPI strips the
+    # body on HEAD automatically when the route is registered for HEAD.
+    @app.api_route("/state", methods=["GET", "HEAD"])
     def get_state(request: Request, round: int | None = None):
         # Cache-friendly state endpoint (task #61). When a worker passes
         # `?round=N`, Cloudflare/CDN treats each round's state as a distinct
