@@ -597,15 +597,19 @@ class Worker:
         )
         if r.status_code == 404:
             # Coord no longer recognizes this worker — it timed us out for
-            # inactivity. Signal a clean stop instead of crashing; caller can
-            # decide whether to re-register (future work).
+            # inactivity. Signal so caller can re-register and resume.
             log.error(
-                "POST /delta -> 404; coord deregistered worker_id=%s. Stopping.",
+                "POST /delta -> 404; coord deregistered worker_id=%s.",
                 self.worker_id,
             )
             return {"ack": None, "state": None, "round": round_no, "state_bytes": 0, "dropped": True}
         r.raise_for_status()
         ack = r.json()
+        # Tier-aware: coord may have re-tuned this worker's inner_steps based
+        # on the throughput we just reported. Stash it on the result so
+        # _apply_sync_result can hand it to the main loop (which applies it
+        # AT THE START of the next round — never mid-inner-loop).
+        new_inner = ack.get("inner_steps")
         if not ack.get("accepted"):
             # Stale-round rejection: in heterogeneous fleets, fast workers can
             # advance the coord past where we submitted. Don't bail — fetch the
@@ -626,8 +630,15 @@ class Worker:
                     "round": int(r2.headers["x-round"]),
                     "state_bytes": len(r2.content),
                     "resync": True,
+                    "inner_steps": new_inner,
                 }
-            return {"ack": ack, "state": None, "round": round_no, "state_bytes": 0}
+            return {
+                "ack": ack,
+                "state": None,
+                "round": round_no,
+                "state_bytes": 0,
+                "inner_steps": new_inner,
+            }
 
         target = ack.get("next_round")
         if target is None:
@@ -653,6 +664,7 @@ class Worker:
             "state": new_state,
             "round": int(r2.headers["x-round"]),
             "state_bytes": len(r2.content),
+            "inner_steps": new_inner,
         }
 
     def _apply_sync_result(self, result: dict) -> bool:
@@ -678,6 +690,18 @@ class Worker:
                 result["round"],
             )
         self.current_round = result["round"]
+        # Tier-aware: coord-assigned inner_steps takes effect from the next
+        # inner loop onward. Safe to mutate self.inner_steps here because we
+        # only call _apply_sync_result between inner loops (run() drains the
+        # previous round's sync BEFORE starting the next run_inner()).
+        new_inner = result.get("inner_steps")
+        if new_inner is not None and new_inner != self.inner_steps:
+            log.warning(
+                "[TIER-AWARE] coord re-tuned inner_steps %d -> %d (applying next round)",
+                self.inner_steps,
+                new_inner,
+            )
+            self.inner_steps = int(new_inner)
         log.info(
             "async sync applied round=%d (%d state bytes)%s",
             self.current_round,
@@ -685,6 +709,42 @@ class Worker:
             " [resync]" if result.get("resync") else "",
         )
         return True
+
+    # -- re-registration after coord-side eviction ----------------------------
+
+    def _reregister_and_resync(self) -> None:
+        """Recover from POST /delta -> 404 by re-registering and pulling the
+        current consensus state. The coord has already dropped our old
+        worker_id (M5-class case from CLAUDE.md "Open: deregistered before
+        first delta"). Without this, the worker bails on a single eviction
+        even though the cohort is healthy and the local model is still useful.
+
+        Optimizer state is preserved (matches the resync path's contract; the
+        momentum buffer is still useful gradient signal). Train loader is
+        rebuilt because the new worker_id changes which shard slice we read.
+        """
+        old_wid = self.worker_id
+        log.warning(
+            "[REREGISTER] coord evicted worker_id=%s; re-registering and resyncing...",
+            old_wid,
+        )
+        # Re-register: new worker_id, fresh inner_steps from coord. world_size
+        # and seed should not change (coord-side immutable across the run).
+        self.register()
+        # Pull current consensus state — same path as initial startup.
+        self.pull_state()  # also refreshes self.last_ref
+        # Rebuild the train_loader with the new worker_id so the shard
+        # partition (worker_id % world_size) is correct. val_loader is
+        # already hard-coded to (worker_id=0, world_size=1) so it doesn't
+        # need rebuilding.
+        self.train_loader = None
+        self._ensure_loader_and_opt()
+        log.warning(
+            "[REREGISTER] resumed as worker_id=%d at round=%d (was worker_id=%s)",
+            self.worker_id,
+            self.current_round,
+            old_wid,
+        )
 
     # -- top-level loop -------------------------------------------------------
 
@@ -728,6 +788,18 @@ class Worker:
                 if pending is not None:
                     result = pending.result()
                     pending = None
+                    # 404 from /delta = coord evicted us. Re-register and
+                    # resync instead of bailing — this is the M5-tier "first
+                    # delta arrives after dereg" recovery path from CLAUDE.md.
+                    # The delta we just computed is wasted (the local θ was
+                    # built on a state the coord no longer recognizes), but
+                    # the worker stays alive and contributes from the next
+                    # round onward.
+                    if result.get("dropped"):
+                        self._reregister_and_resync()
+                        # Skip submitting this round's stale delta — start
+                        # fresh from the next inner loop.
+                        continue
                     if not self._apply_sync_result(result):
                         log.error("sync failed; stopping early")
                         break

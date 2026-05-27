@@ -32,9 +32,15 @@ class RoundStatus(BaseModel):
     waiting_for: int  # world_size - n_submitted
     last_val_loss: float | None = None  # mean val loss across workers from the previous round
     flops_total: float = 0.0  # cumulative training FLOPs estimate
+    flops_alarm_threshold: float = 0.0  # 0 = disabled; >0 = warn when flops_total ≥ this
     round_open_seconds: float = 0.0  # wall-clock the current round has been open
     round_timeout_seconds: float = 0.0  # coord-configured eviction timeout (0 = disabled)
     min_workers: int = 1  # min deltas needed to force-advance on timeout
+    # Tier-aware scheduling — when enabled, the coord assigns each worker a
+    # per-worker `inner_steps` so that every worker finishes its inner loop in
+    # ~`target_round_seconds` regardless of GPU speed. 0/false = uniform.
+    target_round_seconds: float = 0.0
+    tier_aware: bool = False
     # Energy / cohort throughput. Both populated as soon as workers start
     # reporting power_watts + tokens_per_sec on /delta.
     energy_wh_total: float = 0.0  # cumulative Wh used by the cohort
@@ -57,6 +63,9 @@ class WorkerInfo(BaseModel):
     last_val_loss: float | None = None
     last_power_watts: float | None = None
     last_tokens_per_sec: float | None = None
+    # Tier-aware scheduling: per-worker inner_steps assigned by the coord.
+    # None until first /delta with a tokens_per_sec report.
+    inner_steps: int | None = None
 
 
 class WorkersResponse(BaseModel):
@@ -67,3 +76,7 @@ class DeltaAck(BaseModel):
     accepted: bool
     reason: str = ""
     next_round: int | None = None  # set when outer step happens immediately
+    # Tier-aware scheduling: when the coord has computed a new per-worker
+    # `inner_steps` from the worker's reported tokens_per_sec, it returns it
+    # here. Worker applies on the NEXT round. None = no change.
+    inner_steps: int | None = None

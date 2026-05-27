@@ -175,6 +175,121 @@ download concurrently. Throughput ~750 k tok/s, ETA ~2 hours.
 below ~30 min, pre-download parquet files to local disk first and switch
 streaming=False. Not done yet.
 
+## Data prep resume (`--resume`, 2026-05-27)
+
+`prepare.py --resume` recovers an interrupted Phase 3 without re-running
+Phase 1+2. Phase 1+2 (BPE training) was already resumable via
+`--reuse-tokenizer`; this closes the loop on Phase 3.
+
+**How it works**: `tokenize_streaming` writes
+`data/cache/prepare_progress.json` (atomic tmp + rename) after every
+batch, recording per-(source, lang) emitted chars + tokens. On
+`--resume`, the orchestrator:
+1. Pins `args.sources` to the existing `manifest.json`'s `source_keys`
+   (new top-level field, format_version bumped to 0.0.4) so a recovery
+   run can't accidentally widen/narrow the corpus shape.
+2. Opens `ShardWriter` in append mode (preserves existing train.bin
+   bytes; `_total` is pre-loaded from `path.stat().st_size // 2`).
+3. Reduces each per-pair budget by chars already emitted: `iter_docs`
+   is called with `max(0, alloc - emitted)`.
+4. Deletes any stale `val.bin` so Phase 4 re-splits cleanly.
+5. Removes `prepare_progress.json` on successful Phase 5 completion.
+
+**Known limitation — prefix duplication**: source `iter_docs` is
+stateless and restarts from the first doc each call. So the resumed
+run re-fetches the prefix (chars 0..emitted) and appends a duplicated
+copy of it to train.bin. The chars-not-yet-reached at crash time
+remain unreached. Net effect: total token count lands within ~10 % of
+a clean run (the test pins this), but the corpus contains some
+near-duplicate prefix per source. Acceptable for "don't lose your
+work" recovery; for a clean rebuild, omit `--resume` and start over.
+
+Test coverage: [tests/test_prepare.py::test_resume_appends_to_existing_train_bin_within_10pct_of_fresh](tests/test_prepare.py).
+
+## Tier-aware scheduling (2026-05-27)
+
+PLAN.md §3's "per-worker `inner_steps`" promise — coord-side adaptive
+scheduler that sizes each worker's inner loop so all workers finish in
+~target_round_seconds regardless of GPU class. Replaces the stopgap
+worker-side `--auto-tune-steps` flag (which still works as a fallback).
+
+**Wire change**: `DeltaAck` gains an optional `inner_steps: int | None`.
+When the coord has re-tuned a worker, the next /delta response carries
+the new value; the worker applies it before its next inner loop. Backward
+compatible — workers that ignore the field stay on whatever they got at
+register time.
+
+**Coord side** ([server.py](src/dllm/coord/server.py) `_maybe_retune_worker`):
+1. Workers report `tokens_per_sec` on every /delta (already did, dashboard
+   used it for cohort throughput).
+2. Coord computes `proposed = clamp(round(tps * target / (batch * seq)),
+   [min_inner_steps, max_inner_steps])` per worker.
+3. Only fires when `|proposed - current| / current > retune_threshold`
+   (default 20%) — kills dashboard churn from tok/s noise.
+4. Stores per-worker `inner_steps` in `self.workers[wid]`; surfaced on
+   `/workers` for the dashboard's active-workers table.
+5. FLOPs accounting reworked: each round's contribution is
+   `sum(worker_inner_steps for worker in deltas_this_round) * batch * seq`,
+   not the old uniform `world_size * default_steps * batch * seq`.
+   Captures the per-worker imbalance correctly.
+
+**Coord CLI**: `--tier-aware`, `--target-round-seconds 600`,
+`--min-inner-steps 50`, `--max-inner-steps 2000`, `--retune-threshold 0.20`,
+`--flops-alarm-threshold 5e24`.
+
+**Worker side** ([worker.py](src/dllm/client/worker.py) `_apply_sync_result`):
+applies `result["inner_steps"]` (carried from ack) by overwriting
+`self.inner_steps` between inner loops. Mutation is safe there because
+`run()` always drains the previous sync BEFORE starting the next
+`run_inner()`.
+
+**Dashboard**: workers table grew an "inner steps" column; current-round
+table gains a "tier-aware scheduling" row showing target_round_seconds.
+
+Coverage: 5 tests in `test_coord_api.py` (per-worker assignment,
+backward-compat off path, retune threshold, /status exposure, FLOPs
+account correctness under tier-aware).
+
+## Worker auto-reregister on /delta 404 (2026-05-27)
+
+CLAUDE.md "Open: M5 deregistered before first delta" — eliminated.
+Previously the coord-side eviction (worker inactive too long) caused
+the worker's next /delta to return 404, and the worker logged "Stopping"
+and exited 0. Now `run()` detects `result["dropped"]`, calls
+`_reregister_and_resync()` which:
+
+1. Re-registers with the same Ed25519 pubkey — gets a fresh `worker_id`
+   from the coord, but signed-delta verification still works because the
+   key didn't change.
+2. Pulls current consensus state into the local model + last_ref.
+3. Rebuilds the train loader with the new worker_id so the
+   `worker_id % world_size` shard slice is correct.
+4. Skips the wasted-delta submission for the iteration it was evicted on
+   (no point — coord doesn't know what state we built it against).
+5. Continues from the next inner loop.
+
+Coverage: `test_worker_reregister_resumes_with_fresh_id` — registers,
+manually evicts at the coord, calls `_reregister_and_resync`, verifies
+the worker got a new id with the same pubkey.
+
+Net effect: an M5 doing a slow first inner loop (~4 min before any
+heartbeat lands) can now be evicted by the coord without bringing the
+worker down. It quietly re-registers, resyncs to the current round, and
+contributes from the next outer step.
+
+## FLOPs alarm (2026-05-27)
+
+PLAN.md §5.3 requirement: alarm at 5×10²⁴ FLOPs to stay safely under the
+EU AI Act systemic-risk threshold (10²⁵). Default `--flops-alarm-threshold
+5e24` on the coord; `/status` includes `flops_alarm_threshold` so the
+dashboard knows what bar to compare against; banner appears at the top
+of the dashboard when `flops_total >= flops_alarm_threshold`. Operator
+can override via `--flops-alarm-threshold 0` (disable) or any other
+positive value.
+
+For Phase 0–1 we're nowhere close (current run is at ~10¹⁷ FLOPs). The
+guardrail matters for the 7B Phase 2 and 70B Phase 3 runs.
+
 ## Pointers
 
 - Architecture + roadmap: [PLAN.md](PLAN.md) (Phase 0/1/2, EU compliance, tier-aware scheduling).

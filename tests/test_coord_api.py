@@ -452,3 +452,323 @@ def test_signed_required_rejects_other_workers_signature(signed_state: Coordinat
     finally:
         Path("tests_tmp_key_c").unlink(missing_ok=True)
         Path("tests_tmp_key_d").unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Tier-aware scheduling (per-worker inner_steps)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tier_state(tmp_path: Path) -> CoordinatorState:
+    """Two-worker coord with tier-aware scheduling on."""
+    cfg = TrainConfig(
+        seq_len=32,
+        micro_batch_size=4,
+        inner_steps=100,
+        max_outer_rounds=2,
+        seed=0,
+    )
+    return CoordinatorState(
+        preset_name="smoke",
+        world_size=2,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        tier_aware=True,
+        target_round_seconds=300.0,
+        min_inner_steps=10,
+        max_inner_steps=2000,
+        retune_threshold=0.10,
+    )
+
+
+def _register_two_workers(client: TestClient) -> None:
+    for i in range(2):
+        rr = client.post(
+            "/register",
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+        )
+        assert rr.status_code == 200
+
+
+def _build_dummy_blob(state: CoordinatorState) -> bytes:
+    """Tiny non-zero delta in the coord's expected codec (fp32 here)."""
+    from dllm.shared.serialize import state_to_bytes
+
+    snap = snapshot(state.model)
+    with torch.no_grad():
+        for p in state.model.parameters():
+            p.add_(torch.randn_like(p) * 0.001)
+    delta = compute_delta(snap, state.model)
+    with torch.no_grad():
+        for n, p in state.model.named_parameters():
+            p.copy_(snap[n])
+    return state_to_bytes(delta)
+
+
+def test_tier_aware_assigns_per_worker_inner_steps(tier_state: CoordinatorState) -> None:
+    """Two workers reporting very different tok/s should end up with very
+    different inner_steps — fast does more, slow does less, both finish in
+    ~target_round_seconds.
+    """
+    client = TestClient(create_app(tier_state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(tier_state)
+    # Worker 0 reports 4000 tok/s (fast 3060 class).
+    # Worker 1 reports 400 tok/s (slow M5 class). 10x ratio.
+    ack0 = client.post(
+        "/delta",
+        params={
+            "worker_id": 0,
+            "round": 0,
+            "val_loss": 5.0,
+            "tokens_per_sec": 4000.0,
+        },
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    ack1 = client.post(
+        "/delta",
+        params={
+            "worker_id": 1,
+            "round": 0,
+            "val_loss": 5.0,
+            "tokens_per_sec": 400.0,
+        },
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+
+    # Both acks should carry retuned inner_steps because they differ from
+    # the default 100 by more than the 10% threshold.
+    assert ack0["inner_steps"] is not None
+    assert ack1["inner_steps"] is not None
+    # Fast worker should do strictly MORE steps than slow worker.
+    assert ack0["inner_steps"] > ack1["inner_steps"]
+
+    # Sanity-check arithmetic: at target=300s, seq=32, batch=4,
+    #   target_tokens(fast) = 4000 * 300 = 1.2M, /128 = 9375 steps clamped 2000
+    #   target_tokens(slow) = 400  * 300 = 120k, /128 = 937.5 -> 938 (banker's)
+    assert ack0["inner_steps"] == 2000  # hit max clamp
+    assert ack1["inner_steps"] == 938
+
+    # /workers should report the per-worker assignment too
+    workers = client.get("/workers").json()["workers"]
+    by_id = {w["worker_id"]: w for w in workers}
+    assert by_id[0]["inner_steps"] == 2000
+    assert by_id[1]["inner_steps"] == 938
+
+
+def test_tier_aware_off_returns_no_inner_steps(state: CoordinatorState) -> None:
+    """When tier_aware is off (default), ack carries no inner_steps update —
+    workers keep using whatever they got at register time. Backward compat.
+    """
+    client = TestClient(create_app(state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(state)
+    ack = client.post(
+        "/delta",
+        params={
+            "worker_id": 0,
+            "round": 0,
+            "tokens_per_sec": 4000.0,
+        },
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack["accepted"] is True
+    assert ack["inner_steps"] is None
+
+
+def test_tier_aware_retune_skips_small_changes(tier_state: CoordinatorState) -> None:
+    """A second report with throughput within retune_threshold of the
+    previous one shouldn't fire a new assignment — avoids dashboard churn
+    from tok/s noise.
+    """
+    client = TestClient(create_app(tier_state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(tier_state)
+    # First report at 2000 tok/s — definitely changes inner_steps from 100.
+    ack0 = client.post(
+        "/delta",
+        params={"worker_id": 0, "round": 0, "tokens_per_sec": 2000.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack0["inner_steps"] is not None
+    first = ack0["inner_steps"]
+
+    # Worker 1 submits to close round 0.
+    client.post(
+        "/delta",
+        params={"worker_id": 1, "round": 0, "tokens_per_sec": 2000.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert tier_state.round == 1
+
+    # Same worker reports 2050 tok/s in round 1 — well within 10% of first.
+    # Coord should NOT re-assign inner_steps.
+    ack1 = client.post(
+        "/delta",
+        params={"worker_id": 0, "round": 1, "tokens_per_sec": 2050.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack1["inner_steps"] is None  # no change
+    # Underlying per-worker value should still match the first assignment.
+    workers = client.get("/workers").json()["workers"]
+    by_id = {w["worker_id"]: w for w in workers}
+    assert by_id[0]["inner_steps"] == first
+
+
+def test_tier_aware_status_exposes_target(tier_state: CoordinatorState) -> None:
+    """/status surfaces target_round_seconds + tier_aware flag for the
+    dashboard's tier-aware indicator.
+    """
+    client = TestClient(create_app(tier_state))
+    s = client.get("/status").json()
+    assert s["tier_aware"] is True
+    assert s["target_round_seconds"] == 300.0
+
+
+def test_tier_aware_flops_account_per_worker(tier_state: CoordinatorState) -> None:
+    """FLOPs accounting under tier-aware: cohort FLOPs sums each worker's
+    actual inner_steps, not world_size × default. The fast worker's larger
+    inner_steps should dominate the round's contribution.
+    """
+    client = TestClient(create_app(tier_state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(tier_state)
+    # Fast + slow; close round to trigger FLOPs accounting.
+    client.post(
+        "/delta",
+        params={"worker_id": 0, "round": 0, "tokens_per_sec": 4000.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    )
+    client.post(
+        "/delta",
+        params={"worker_id": 1, "round": 0, "tokens_per_sec": 400.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert tier_state.round == 1
+    flops = client.get("/status").json()["flops_total"]
+    # Per-worker steps fast=2000, slow=937 → total tokens = (2000 + 937) * 128.
+    # Single-tier baseline would be 100 * 2 * 128 = 25600 tok. Per-worker
+    # accounting gives (2000 + 937) * 128 = 375 936 tok — >10× higher.
+    n_params = float(tier_state.model.num_params(non_embedding=False))
+    expected_lo = 6.0 * n_params * (2000 + 900) * 128  # generous floor
+    assert flops > expected_lo
+
+
+# ---------------------------------------------------------------------------
+# FLOPs alarm threshold (EU AI Act systemic-risk pre-warning)
+# ---------------------------------------------------------------------------
+
+
+def test_flops_alarm_threshold_default_5e24(state: CoordinatorState) -> None:
+    """Default alarm is 5e24 (half of EU AI Act 10²⁵ systemic-risk line)."""
+    client = TestClient(create_app(state))
+    s = client.get("/status").json()
+    assert s["flops_alarm_threshold"] == 5e24
+
+
+def test_flops_alarm_threshold_configurable(tmp_path: Path) -> None:
+    """Operator can lower the threshold (e.g. for a 7B Phase 2 run that's
+    already approaching the line)."""
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        flops_alarm_threshold=1e23,
+    )
+    client = TestClient(create_app(coord))
+    s = client.get("/status").json()
+    assert s["flops_alarm_threshold"] == 1e23
+
+
+# ---------------------------------------------------------------------------
+# Worker auto-reregister on /delta 404
+# ---------------------------------------------------------------------------
+
+
+def test_worker_reregister_resumes_with_fresh_id(tmp_path: Path) -> None:
+    """When the coord evicts a worker (e.g. inactivity timeout), a fresh
+    /delta returns 404. The worker's _reregister_and_resync method should
+    re-register, pull state, and resume — assigning a NEW worker_id with
+    the SAME pubkey. CLAUDE.md "Open: M5 deregistered before first delta".
+    """
+    import io
+    from pathlib import Path as P
+
+    from dllm.client.worker import Worker, pick_device
+    from dllm.data.loader import ShardLoader
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex
+
+    # Build a small fake corpus the loader can chew on. Tokens must be
+    # uint16 for ShardLoader; ShardLoader needs at least seq_len*batch+1.
+    train_bin = tmp_path / "train.bin"
+    n_tokens = 32 * 4 * 8  # generous
+    import numpy as np
+    np.array(range(n_tokens), dtype=np.uint16).tofile(train_bin)
+
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+    )
+    client = TestClient(create_app(coord))
+
+    # Build a real Worker but point its http session at the TestClient. The
+    # Worker class only uses .post / .get / .raise_for_status which
+    # TestClient implements.
+    device = pick_device("cpu")
+    w = Worker(
+        coord_url="http://testserver",
+        preset="smoke",
+        country="XX",
+        device=device,
+        train_data=train_bin,
+        val_data=None,
+        bf16=False,
+        val_batches=1,
+    )
+    w.http = client  # type: ignore[assignment]
+
+    # First registration cycle.
+    w.register()
+    first_id = w.worker_id
+    assert first_id == 0
+    w.pull_state()
+    w._ensure_loader_and_opt()
+
+    # Coord-side eviction: simulate the stale-registration sweep dropping
+    # this worker (same mechanism as worker_inactive_timeout firing).
+    with coord.lock:
+        del coord.workers[first_id]
+
+    # Re-register path runs: should get a NEW worker_id but preserve pubkey.
+    pre_pubkey = w.pubkey_hex
+    w._reregister_and_resync()
+    assert w.worker_id != first_id  # got fresh id
+    assert w.worker_id == 1  # next_worker_id was 1
+    assert w.pubkey_hex == pre_pubkey  # same Ed25519 key, same identity
+    # Coord now sees the new registration.
+    assert w.worker_id in coord.workers

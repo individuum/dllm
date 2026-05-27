@@ -72,6 +72,12 @@ class CoordinatorState:
         min_workers: int = 1,
         worker_inactive_timeout_seconds: float = 1800.0,
         enable_timeout_thread: bool = True,
+        tier_aware: bool = False,
+        target_round_seconds: float = 600.0,
+        min_inner_steps: int = 50,
+        max_inner_steps: int = 2000,
+        retune_threshold: float = 0.20,
+        flops_alarm_threshold: float = 5e24,
     ) -> None:
         if preset_name not in PRESETS:
             raise ValueError(f"unknown preset {preset_name!r}; have {list(PRESETS)}")
@@ -99,6 +105,25 @@ class CoordinatorState:
         # world_size matches the count of actually-contributing workers.
         # 0 disables auto-eviction.
         self.worker_inactive_timeout_seconds = max(0.0, worker_inactive_timeout_seconds)
+        # Tier-aware scheduling (PLAN §3 / CLAUDE.md "tier-aware"). When ON,
+        # each worker's `inner_steps` is recomputed from its measured tok/s so
+        # all workers finish inner loops in ~target_round_seconds regardless
+        # of GPU class. Fast workers do more steps; slow ones do fewer.
+        # Without this, a fast worker idles waiting for the slowest, or the
+        # slow one gets evicted by the round timeout — both wasteful.
+        self.tier_aware = tier_aware
+        self.target_round_seconds = max(60.0, target_round_seconds)
+        self.min_inner_steps = max(1, min_inner_steps)
+        self.max_inner_steps = max(self.min_inner_steps, max_inner_steps)
+        # Only re-assign when the new value differs from the current one by
+        # more than `retune_threshold` (fractional). Stops dashboard churn
+        # from jitter — a worker reporting 3700 → 3680 tok/s won't flip
+        # inner_steps every round.
+        self.retune_threshold = max(0.0, retune_threshold)
+        # EU AI Act systemic-risk threshold is 10²⁵ FLOPs (PLAN §5.3); we
+        # alarm at half that so the operator has time to plan a soft landing
+        # / CoP Safety chapter prep / AI Office notification window.
+        self.flops_alarm_threshold = max(0.0, flops_alarm_threshold)
         # Ring buffer of (round, val_loss, flops_total, ts) appended at each
         # outer step. Powers the dashboard chart at GET /.
         # Persisted to <checkpoint_dir>/history.jsonl (append-only NDJSON)
@@ -362,16 +387,41 @@ class CoordinatorState:
         """Signal the timeout thread to exit. Idempotent; thread is daemon anyway."""
         self._timeout_stop.set()
 
-    def _estimate_round_flops(self) -> float:
-        """Crude FLOPs estimate: 6 * N_params * tokens_per_round * world_size.
+    def _estimate_round_flops(self, contributors: list[int] | None = None) -> float:
+        """FLOPs estimate: 6 * N_params * sum(per-worker tokens this round).
 
         6 = 2 (forward) + 4 (backward) per param per token. Coarse but tracks
         the right order of magnitude — enough for AI-Act-threshold monitoring.
+
+        With tier-aware scheduling, workers do different `inner_steps` so we
+        sum each worker's actual contribution instead of multiplying by a
+        single world_size×inner_steps figure. Workers without a tracked
+        inner_steps fall back to the global config default.
+
+        Caller passes the list of worker_ids that submitted in the current
+        round (captured BEFORE deltas are cleared in _outer_step_locked).
+        When None, falls back to the legacy world_size × default-steps
+        estimate (used by tests / startup states).
+
+        Caller holds self.lock.
         """
         n_params = float(self.model.num_params(non_embedding=False))
         toks_per_step = self.train_cfg.seq_len * self.train_cfg.micro_batch_size
-        toks_per_round = toks_per_step * self.train_cfg.inner_steps
-        return 6.0 * n_params * toks_per_round * float(self.world_size)
+        if contributors:
+            toks_per_round = 0
+            for wid in contributors:
+                steps = int(
+                    self.workers.get(wid, {}).get(
+                        "inner_steps", self.train_cfg.inner_steps
+                    )
+                )
+                toks_per_round += toks_per_step * steps
+        else:
+            # Fall back to the legacy world_size × default-steps estimate.
+            toks_per_round = (
+                toks_per_step * self.train_cfg.inner_steps * self.world_size
+            )
+        return 6.0 * n_params * toks_per_round
 
     # -- API used by FastAPI handlers ----------------------------------------
 
@@ -395,6 +445,8 @@ class CoordinatorState:
 
             wid = self.next_worker_id
             self.next_worker_id += 1
+            # Per-worker inner_steps: starts at the global default and gets
+            # retuned by submit_delta() once the worker reports tokens_per_sec.
             self.workers[wid] = {
                 "pubkey_hex": req.pubkey,
                 "pubkey": parsed_pubkey,
@@ -403,6 +455,7 @@ class CoordinatorState:
                 "vram_gb": req.vram_gb,
                 "ram_gb": req.ram_gb,
                 "registered_at": time.time(),
+                "inner_steps": self.train_cfg.inner_steps,
             }
             log.info(
                 "register worker=%d country=%s gpu=%s preset=%s",
@@ -434,9 +487,12 @@ class CoordinatorState:
                 waiting_for=max(0, self.world_size - n_sub),
                 last_val_loss=self.last_val_loss,
                 flops_total=self.flops_total,
+                flops_alarm_threshold=self.flops_alarm_threshold,
                 round_open_seconds=time.time() - self.round_started_at,
                 round_timeout_seconds=self.round_timeout_seconds,
                 min_workers=self.min_workers,
+                target_round_seconds=self.target_round_seconds if self.tier_aware else 0.0,
+                tier_aware=self.tier_aware,
                 energy_wh_total=self.energy_wh_total,
                 last_power_watts=self.last_power_watts,
                 last_power_watts_per_worker=self.last_power_watts_per_worker,
@@ -461,6 +517,7 @@ class CoordinatorState:
                     "last_val_loss": w.get("last_val_loss"),
                     "last_power_watts": w.get("last_power_watts"),
                     "last_tokens_per_sec": w.get("last_tokens_per_sec"),
+                    "inner_steps": w.get("inner_steps"),
                 }
                 for wid, w in sorted(self.workers.items())
             ]
@@ -531,11 +588,55 @@ class CoordinatorState:
                 f" val_loss={val_loss:.4f}" if val_loss is not None else "",
                 f" power={power_watts:.0f}W" if power_watts is not None else "",
             )
+            # Tier-aware retune: now that we have this worker's measured tok/s,
+            # see if a different inner_steps would land closer to
+            # target_round_seconds. Only return a new value when the change is
+            # material (avoid dashboard churn on noise).
+            new_inner = self._maybe_retune_worker(worker_id, tokens_per_sec)
             ready = len(self.deltas[self.round]) >= self.world_size
             if ready:
                 self._outer_step_locked()
-                return DeltaAck(accepted=True, next_round=self.round)
-            return DeltaAck(accepted=True)
+                return DeltaAck(
+                    accepted=True, next_round=self.round, inner_steps=new_inner
+                )
+            return DeltaAck(accepted=True, inner_steps=new_inner)
+
+    def _maybe_retune_worker(
+        self, worker_id: int, tokens_per_sec: float | None
+    ) -> int | None:
+        """Compute a new per-worker inner_steps if tier_aware is on AND the
+        reported throughput suggests a materially different value than the
+        worker is currently using. Mutates self.workers[worker_id]["inner_steps"]
+        and returns the new value when a retune fired; None otherwise.
+
+        Caller holds self.lock.
+        """
+        if not self.tier_aware or tokens_per_sec is None or tokens_per_sec <= 0:
+            return None
+        toks_per_step = self.train_cfg.seq_len * self.train_cfg.micro_batch_size
+        target_tokens = tokens_per_sec * self.target_round_seconds
+        proposed = int(round(target_tokens / max(1, toks_per_step)))
+        proposed = max(self.min_inner_steps, min(self.max_inner_steps, proposed))
+        ws = self.workers[worker_id]
+        current = int(ws.get("inner_steps", self.train_cfg.inner_steps))
+        if current <= 0:
+            current = self.train_cfg.inner_steps
+        # Only retune when |Δ| / current > retune_threshold.
+        rel_change = abs(proposed - current) / max(1, current)
+        if rel_change < self.retune_threshold:
+            return None
+        ws["inner_steps"] = proposed
+        log.info(
+            "[TIER-AWARE] worker=%d retune inner_steps %d -> %d "
+            "(tok/s=%.0f, target=%.0fs, |Δ|/cur=%.2f)",
+            worker_id,
+            current,
+            proposed,
+            tokens_per_sec,
+            self.target_round_seconds,
+            rel_change,
+        )
+        return proposed
 
     # -- outer optimizer step (caller holds lock) -----------------------------
 
@@ -552,6 +653,10 @@ class CoordinatorState:
         # off the OOM-killer's radar on small VPSes.
         round_deltas = list(self.deltas[self.round].values())
         n_deltas_in_round = len(round_deltas)  # captured before we free the list
+        # Capture worker IDs BEFORE we clear the deltas dict — used by the
+        # tier-aware FLOPs accounting below to sum each contributor's actual
+        # inner_steps (which can differ across the cohort under tier-aware).
+        contributors = list(self.deltas[self.round].keys())
         avg = average_deltas(round_deltas)
         # Free the per-worker delta tensors immediately; the averaged copy
         # in `avg` is the only thing the outer step still needs.
@@ -583,7 +688,7 @@ class CoordinatorState:
             self.last_val_loss = sum(self.val_losses[self.round]) / len(
                 self.val_losses[self.round]
             )
-        self.flops_total += self._estimate_round_flops()
+        self.flops_total += self._estimate_round_flops(contributors)
 
         # Cohort power + throughput aggregation. Both are SUMS because workers
         # train simultaneously — cohort instantaneous draw is the sum of each
@@ -805,6 +910,55 @@ def main() -> None:
             "from piling up in the dashboard's active-workers table. 0 disables."
         ),
     )
+    ap.add_argument(
+        "--tier-aware",
+        action="store_true",
+        help=(
+            "Coord-side tier-aware scheduling: assign each worker a "
+            "per-worker inner_steps so every worker finishes its inner loop "
+            "in ~--target-round-seconds regardless of GPU class. Lets a fast "
+            "3060 and a slow M5 share the same round cadence without eviction. "
+            "See PLAN §3."
+        ),
+    )
+    ap.add_argument(
+        "--target-round-seconds",
+        type=float,
+        default=600.0,
+        help="Per-worker wall clock target for the inner loop when --tier-aware is on.",
+    )
+    ap.add_argument(
+        "--min-inner-steps",
+        type=int,
+        default=50,
+        help="Clamp lower bound for tier-aware inner_steps (DiLoCo paper guidance).",
+    )
+    ap.add_argument(
+        "--max-inner-steps",
+        type=int,
+        default=2000,
+        help="Clamp upper bound for tier-aware inner_steps (drift control).",
+    )
+    ap.add_argument(
+        "--retune-threshold",
+        type=float,
+        default=0.20,
+        help=(
+            "Tier-aware retune fires only when |Δ inner_steps| / current "
+            "exceeds this fraction. Avoids dashboard churn from tok/s noise."
+        ),
+    )
+    ap.add_argument(
+        "--flops-alarm-threshold",
+        type=float,
+        default=5e24,
+        help=(
+            "Cumulative FLOPs at which /status surfaces an alarm flag. "
+            "Default 5×10²⁴ — half of the EU AI Act systemic-risk threshold "
+            "(10²⁵), buys planning time for CoP Safety chapter prep + "
+            "AI Office notification. 0 disables."
+        ),
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -840,6 +994,12 @@ def main() -> None:
         round_timeout_seconds=args.round_timeout_seconds,
         min_workers=args.min_workers,
         worker_inactive_timeout_seconds=args.worker_inactive_timeout_seconds,
+        tier_aware=args.tier_aware,
+        target_round_seconds=args.target_round_seconds,
+        min_inner_steps=args.min_inner_steps,
+        max_inner_steps=args.max_inner_steps,
+        retune_threshold=args.retune_threshold,
+        flops_alarm_threshold=args.flops_alarm_threshold,
     )
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

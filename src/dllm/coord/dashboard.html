@@ -107,6 +107,15 @@
 <body>
   <h1>dllm coordinator <span class="live" id="liveDot">live</span></h1>
 
+  <div id="flopsAlarmBanner" style="display:none;margin:0 0 1rem;padding:0.75rem 1rem;
+    background:rgba(217,119,6,0.10);border:1px solid var(--warn);border-radius:6px;
+    color:var(--warn);font-size:0.95rem">
+    <strong>⚠ FLOPs alarm:</strong>
+    <span id="flopsAlarmDetail">—</span>
+    — approaching EU AI Act systemic-risk threshold (10²⁵).
+    See <a href="https://github.com/individuum/dllm/blob/main/PLAN.md#53-eu-ai-act-expanded">PLAN §5.3</a>.
+  </div>
+
   <div class="grid">
     <div class="card"><div class="label">round</div>
       <div class="value" id="round">—</div>
@@ -198,6 +207,7 @@
       <tr><td>round open</td><td id="open">—</td></tr>
       <tr><td>quorum</td><td id="quorum">—</td></tr>
       <tr><td>timeout policy</td><td id="timeout">—</td></tr>
+      <tr><td>tier-aware scheduling</td><td id="tier_aware">—</td></tr>
     </table>
   </div>
 
@@ -210,10 +220,11 @@
         <th class="num">last round</th>
         <th class="num">last power</th>
         <th class="num">last tok/s</th>
+        <th class="num">inner steps</th>
         <th class="num">last val</th>
         <th>last seen</th>
       </tr></thead>
-      <tbody id="workers_table"><tr><td colspan="9" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
+      <tbody id="workers_table"><tr><td colspan="10" style="text-align:center;color:var(--muted)">loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -619,7 +630,7 @@ function renderTooltipContent(pt, currentMetricObj) {
 function renderWorkersTable(workers, currentRound) {
   if (!workers.length) {
     document.getElementById("workers_table").innerHTML =
-      '<tr><td colspan="9" style="text-align:center;color:var(--muted)">no workers registered</td></tr>';
+      '<tr><td colspan="10" style="text-align:center;color:var(--muted)">no workers registered</td></tr>';
     return;
   }
   const now = Date.now() / 1000;
@@ -652,6 +663,7 @@ function renderWorkersTable(workers, currentRound) {
       `<td class="num">${lastRound != null ? lastRound : "—"}</td>` +
       `<td class="num">${w.last_power_watts != null ? fmtWatts(w.last_power_watts) : "—"}</td>` +
       `<td class="num">${w.last_tokens_per_sec != null ? fmtTokPerS(w.last_tokens_per_sec) : "—"}</td>` +
+      `<td class="num">${w.inner_steps != null ? w.inner_steps : "—"}</td>` +
       `<td class="num">${w.last_val_loss != null ? w.last_val_loss.toFixed(4) : "—"}</td>` +
       `<td>${lastSeenStr}${statusBadge}</td>` +
       `</tr>`;
@@ -857,6 +869,21 @@ async function refresh() {
     document.getElementById("flops").textContent = fmtFlops(status.flops_total);
     document.getElementById("flops_sub").textContent =
       ((status.flops_total / 1e25) * 100).toFixed(4) + "% of 10²⁵ systemic-risk line";
+
+    // FLOPs alarm: surface when cumulative FLOPs ≥ configured threshold.
+    // Default is 5e24 (half of systemic-risk line) so the operator has
+    // time to prep CoP Safety chapter / notify AI Office. PLAN §5.3.
+    const alarm_threshold = status.flops_alarm_threshold || 0;
+    const banner = document.getElementById("flopsAlarmBanner");
+    if (banner && alarm_threshold > 0 && status.flops_total >= alarm_threshold) {
+      banner.style.display = "block";
+      const pct = ((status.flops_total / 1e25) * 100).toFixed(2);
+      document.getElementById("flopsAlarmDetail").textContent =
+        `cumulative ${fmtFlops(status.flops_total)} (${pct}% of 10²⁵, threshold ${fmtFlops(alarm_threshold)})`;
+    } else if (banner) {
+      banner.style.display = "none";
+    }
+
     document.getElementById("workers").textContent = status.n_registered;
     const ws_target = status.n_submitted + status.waiting_for;
     const phase = status.n_submitted >= ws_target
@@ -871,6 +898,15 @@ async function refresh() {
       `${status.n_submitted} submitted · ${status.waiting_for} pending · min_workers=${status.min_workers}`;
     document.getElementById("timeout").textContent =
       `force-advance after ${fmtSeconds(status.round_timeout_seconds)} if ≥${status.min_workers} delta(s) in`;
+    // Tier-aware indicator: when on, every worker gets a per-worker
+    // inner_steps so the slowest doesn't gate cohort cadence. Off = uniform
+    // inner_steps for everyone (legacy default).
+    const tierEl = document.getElementById("tier_aware");
+    if (tierEl) {
+      tierEl.textContent = status.tier_aware
+        ? `ON · target ${fmtSeconds(status.target_round_seconds || 0)}/worker · inner_steps re-tuned per worker from measured tok/s`
+        : "off · uniform inner_steps for all workers";
+    }
 
     // staleness signal
     const now = Date.now();
