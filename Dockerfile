@@ -25,9 +25,9 @@ CMD [ \
     "--port", "8000", \
     "--preset", "300M", \
     "--world-size", "1", \
-    "--inner-steps", "200", \
+    "--inner-steps", "400", \
     "--seq-len", "4096", \
-    "--micro-batch-size", "4", \
+    "--micro-batch-size", "2", \
     "--checkpoint-dir", "/data/checkpoints", \
     "--checkpoint-every", "3", \
     "--require-signed-deltas", \
