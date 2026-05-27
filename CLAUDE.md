@@ -417,9 +417,39 @@ the log-line → signal contract. PySide6 is `importorskip`-gated so the
 test module just skips on core-only installs.
 
 **PyInstaller bundle** lives at [packaging/desktop/dllm_desktop.spec](packaging/desktop/dllm_desktop.spec).
-One-folder mode (PyTorch CUDA + Qt resist single-file packing). Build with
-`pyinstaller packaging/desktop/dllm_desktop.spec --clean --noconfirm`. Output
-is ~2 GB on Windows. v0 unsigned; signing + auto-update are Phase 1 wrap-up.
+**Lean-launcher design** (2026-05-27 pivot): bundle EXCLUDES torch + numpy +
+safetensors + heavy ML deps (those land in a per-user runtime fetched on
+first launch from PyTorch's official CDN). Bundle is ~150 MB launcher;
+runtime is ~2 GB downloaded once into `<user_data>/runtime/`. Subsequent
+launches are instant.
+
+Rationale: the previous monolithic spec produced a 5.2 GB bundle —
+above GitHub Releases' 2 GB per-asset cap, and the user would download
+the entire CUDA stack even if their machine already had a PyTorch venv.
+The lean launcher splits the concerns:
+- **Launcher** = PySide6 GUI + bootstrap + dllm.desktop code. Small,
+  ships in github releases / VPS `/downloads/`. Signing eventually.
+- **Runtime** = pip-installed PyTorch + deps. Sourced from PyTorch's
+  official CDN (their bandwidth, not ours; always latest wheel).
+
+Modules added:
+- `dllm.desktop.runtime_manager` — `is_installed()`, `runtime_python()`,
+  `install_runtime(progress_callback)`. Marker file at
+  `<runtime_dir>/runtime_installed.json` caches the install state.
+- `dllm.desktop.bootstrap_dialog` — `QDialog` with progress bar that
+  spawns a worker thread running `install_runtime()`.
+- `MainWindow._on_start_clicked` gates on `is_installed()` when frozen;
+  opens BootstrapDialog if missing. Dev mode (`not sys.frozen`) skips
+  the gate entirely and uses `sys.executable` as the worker interpreter.
+- `WorkerRunner._build_argv` picks the runtime's `python.exe` when
+  installed, falls back to `sys.executable --worker-mode` when frozen
+  but un-bootstrapped.
+
+Build with `pyinstaller packaging/desktop/dllm_desktop.spec --clean
+--noconfirm`. Coverage: 8 tests in `test_runtime_manager.py` for the
+state-check helpers + 7 in `test_desktop_runner.py` for log parsing.
+
+v0 unsigned; signing + auto-update are Phase 1 wrap-up.
 
 **What's missing for full Phase 1 (volunteer-facing release)**:
 - Coord-side `/shard?worker_id=N&world_size=K` endpoint so the GUI

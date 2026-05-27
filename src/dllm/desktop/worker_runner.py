@@ -163,10 +163,32 @@ class WorkerRunner(QObject):
         require_gpu: bool,
         extra_args: list[str],
     ) -> list[str]:
-        # Frozen (PyInstaller) bundle: re-exec our own binary with the
-        # `--worker-mode` shim. Dev mode: spawn `python -m dllm.client.worker`.
+        # Three execution flavours, picked at runtime:
+        #
+        #   1) Frozen launcher + bootstrapped runtime present
+        #      → spawn the runtime's python.exe with -m dllm.client.worker.
+        #        This is the production volunteer flow: lean launcher
+        #        +`%APPDATA%/dllm/runtime/python.exe`.
+        #
+        #   2) Frozen launcher + NO runtime
+        #      → fall back to `sys.executable --worker-mode`, which works
+        #        only if the bundle includes torch (heavy-bundle build).
+        #        Lean builds raise instead — MainWindow should block start
+        #        until bootstrap completes, so this branch only triggers
+        #        on a corrupt install.
+        #
+        #   3) Dev mode (not frozen)
+        #      → `python -m dllm.client.worker` against the venv that's
+        #        running the GUI. Skips bootstrap.
+        from . import runtime_manager  # local import: avoid cycle on cold start
+
         if getattr(sys, "frozen", False):
-            argv = [sys.executable, "--worker-mode"]
+            if runtime_manager.is_installed():
+                py = str(runtime_manager.runtime_python())
+                argv = [py, "-u", "-m", "dllm.client.worker"]
+            else:
+                # No runtime yet but we have a heavy bundle — re-exec self.
+                argv = [sys.executable, "--worker-mode"]
         else:
             argv = [sys.executable, "-u", "-m", "dllm.client.worker"]
         argv += [

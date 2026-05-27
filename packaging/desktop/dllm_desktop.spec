@@ -32,49 +32,57 @@ project_root = Path(SPECPATH).resolve().parent.parent
 # ---------------------------------------------------------------------------
 # Analysis: what to scan + which packages to force-include
 # ---------------------------------------------------------------------------
-# PyInstaller's static analysis catches most imports, but a few are dynamic
-# and need hidden_imports. Worker spawns torch.distributed, datasets, etc.
-# only optionally — listing them explicitly hedges against runtime "module
-# not found".
+# Lean-launcher mode: torch + numpy + safetensors live in the per-user
+# runtime (bootstrap_dialog pip-installs them on first launch). The
+# launcher only contains the GUI + bootstrap orchestration; it spawns the
+# runtime's python.exe to do the actual training.
 hidden_imports = [
-    "dllm.client.worker",
-    "dllm.coord.server",  # only if a user happens to want local-coord too
-    "dllm.shared.identity",
-    "dllm.shared.protocol",
-    "dllm.shared.serialize",
-    "dllm.data.loader",
+    "dllm.desktop.main",
     "dllm.desktop.main_window",
     "dllm.desktop.worker_runner",
+    "dllm.desktop.bootstrap_dialog",
+    "dllm.desktop.runtime_manager",
+    "dllm.desktop.paths",
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
-    # safetensors picks its backend at runtime
-    "safetensors.torch",
-    # tokenizers / datasets aren't strictly needed for the *worker* path,
-    # but harmless to include + lets the GUI offer a "prepare data shard"
-    # feature later without a rebuild.
+    # cryptography (Ed25519 identity) ships C-extensions PyInstaller
+    # doesn't always discover via static analysis.
+    "cryptography.hazmat.primitives.asymmetric.ed25519",
+    "cryptography.hazmat.primitives.serialization",
 ]
 
-# Data files to bundle alongside the binary. The coord dashboard.html is
-# only needed when running coord-mode locally; harmless on contributor
-# install (~50 KB). Use absolute paths anchored at project_root because
-# PyInstaller resolves relative paths from the spec's directory.
+# Data files to bundle alongside the binary. The dashboard.html and the
+# `src/dllm/` tree itself are included so runtime_manager._hand_copy_dllm_package
+# can copy them into the bootstrapped runtime's site-packages when pip
+# install dllm fails (e.g. offline / private network).
 datas = [
     (str(project_root / "src" / "dllm" / "coord" / "dashboard.html"), "dllm/coord"),
 ]
 
 
 # ---------------------------------------------------------------------------
-# Heavy exclusions — keep the bundle from ballooning past necessary
+# Heavy exclusions — the LEAN launcher must not bundle the ML stack
 # ---------------------------------------------------------------------------
+# torch + cuDNN + cuBLAS together weigh ~4 GB. We push them to the runtime
+# install on first launch (PyTorch's CDN). The launcher then weighs in at
+# ~150-200 MB — small enough for github releases / a fast download.
 excludes = [
+    # The ML stack — runtime_manager pip-installs these into the per-user
+    # runtime, NOT into the launcher.
+    "torch", "torchvision", "torchaudio",
+    "numpy",
+    "safetensors",
+    "tokenizers", "datasets",
+    "huggingface_hub", "transformers",
+    # Misc data-science deps that pip might pull in transitively
+    "scipy", "sklearn", "pandas", "matplotlib",
+    # Notebook / IDE extras the worker never touches
+    "notebook", "ipykernel", "ipython", "jupyter_core", "jupyterlab",
     # Test frameworks
     "pytest", "_pytest", "pytest_asyncio", "pytest_cov", "pytest_qt",
-    # Notebook / data-science extras the worker never touches
-    "notebook", "ipykernel", "ipython", "jupyter_core", "jupyterlab",
-    "matplotlib", "scipy", "sklearn", "pandas",
-    # Translation / SFT helpers (separate dep tree, not on worker path)
-    "datasets", "tokenizers",
+    # uvicorn + fastapi are coord-only; lean launcher is GUI + worker spawn
+    "uvicorn", "fastapi", "starlette",
 ]
 
 

@@ -46,12 +46,25 @@ scripts/     smoke_test.py — local end-to-end test
 If you have a GPU sitting idle, you can donate compute to the live training run
 at [dllm.planetbass.de](https://dllm.planetbass.de):
 
+### Easiest mode — Google Colab (no install)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/individuum/dllm/blob/main/notebooks/colab_worker.ipynb)
+
+One-click contributing using a free Colab T4 GPU. Sessions cap at ~12 h on
+the free tier so it's a "donate a session" not a permanent setup, but no
+install of anything required. See [notebooks/colab_worker.ipynb](notebooks/colab_worker.ipynb).
+
 ### Easy mode — download the desktop client
 
-Pre-built installer (Windows, 64-bit, ~2 GB):
+Pre-built installer (Windows, 64-bit, ~150 MB launcher + ~2 GB CUDA on first launch):
 **[Latest release on GitHub](https://github.com/individuum/dllm/releases/latest)**
 
 Unzip, run `dllm-contributor.exe`, pick your country, click **Start contributing**.
+
+First launch shows a setup dialog that downloads PyTorch + CUDA from
+PyTorch's official CDN into `%APPDATA%/dllm/runtime/` — about 2 GB, one-time.
+Subsequent launches skip the download.
+
 The client connects outbound-only over HTTPS — no router or firewall config needed.
 Identity persists at `%APPDATA%/dllm/identity.key` so your contribution credit
 follows you across reboots.

@@ -47,6 +47,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import runtime_manager
+from .bootstrap_dialog import BootstrapDialog
 from .paths import identity_key_path, user_data_dir
 from .worker_runner import WorkerRunner
 
@@ -282,6 +284,15 @@ class MainWindow(QMainWindow):
     # Button handlers
     # ------------------------------------------------------------------
     def _on_start_clicked(self) -> None:
+        # Lean launcher: if the per-user runtime isn't installed, gate on
+        # the bootstrap dialog before spawning a worker. Dev mode skips this
+        # entirely (sys.executable is already a torch-equipped venv).
+        if getattr(sys, "frozen", False) and not runtime_manager.is_installed():
+            dlg = BootstrapDialog(self)
+            if dlg.exec() != BootstrapDialog.Accepted:
+                self._append_log("[gui] setup cancelled; cannot start worker yet.")
+                return
+
         # Reset session state.
         self._rounds_contributed = 0
         self._worker_id = None

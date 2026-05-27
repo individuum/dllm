@@ -20,17 +20,22 @@ import sys
 
 
 def main() -> int:
+    # NOTE: must use ABSOLUTE imports here, not relative — when this module
+    # is the entry point of a PyInstaller bundle it has no parent package,
+    # so `from ..client.worker` raises ImportError at runtime. Absolute
+    # imports work in both the dev path (`python -m dllm.desktop.main`)
+    # and the frozen bundle.
     if len(sys.argv) > 1 and sys.argv[1] == "--worker-mode":
         # Strip the --worker-mode shim so argparse in worker.main() sees a
         # vanilla argv. Everything after is passed through unchanged.
         sys.argv = [sys.argv[0]] + sys.argv[2:]
-        from ..client.worker import main as worker_main
+        from dllm.client.worker import main as worker_main
 
         worker_main()
         return 0
     # Default: launch the GUI. Imported lazily so the --worker-mode path
     # never has to pay PySide6's ~200 MB resident-memory tax.
-    from .main_window import run_app
+    from dllm.desktop.main_window import run_app
 
     return run_app()
 
