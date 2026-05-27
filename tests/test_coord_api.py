@@ -177,6 +177,21 @@ def test_parallel_state_get_assembles_full_body(client: TestClient) -> None:
     assert r.headers.get("x-round") == "0"
 
 
+def test_parallel_state_get_response_supports_raise_for_status(client: TestClient) -> None:
+    """Regression: the synthesized httpx.Response from parallel_state_get
+    must allow .raise_for_status() — the worker's call sites use it. Earlier
+    bug: missing `request=` arg crashed with 'Cannot call raise_for_status
+    as the request instance has not been set'.
+    """
+    from dllm.client.worker import parallel_state_get
+
+    r = parallel_state_get(client, "/state", n_chunks=4, log_label="test")
+    # Should NOT raise — status_code is 200.
+    r.raise_for_status()
+    # And the response must have a request attached for httpx internals.
+    assert r.request is not None
+
+
 def test_delta_rejects_unknown_worker(client: TestClient) -> None:
     r = client.post("/delta", params={"worker_id": 999, "round": 0}, content=b"")
     assert r.status_code == 404

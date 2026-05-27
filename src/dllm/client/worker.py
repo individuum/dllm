@@ -266,23 +266,26 @@ def parallel_state_get(
     t0 = _time.time()
     chunks: list[bytes | None] = [None] * len(ranges)
     common_headers: dict[str, str] = {}
+    sample_request: httpx.Request | None = None
 
-    def _fetch(idx: int, start: int, end: int) -> tuple[int, bytes, dict]:
+    def _fetch(idx: int, start: int, end: int):
         r = client.get(url, headers={"Range": f"bytes={start}-{end}"})
         r.raise_for_status()
         if r.status_code not in (206, 200):
             raise httpx.HTTPError(f"unexpected status {r.status_code} on Range fetch")
-        return idx, r.content, dict(r.headers)
+        return idx, r.content, dict(r.headers), r.request
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     with ThreadPoolExecutor(max_workers=n, thread_name_prefix="dllm-state-pull") as pool:
         futures = [pool.submit(_fetch, i, s, e) for i, s, e in ranges]
         for fut in as_completed(futures):
-            idx, body, hdrs = fut.result()
+            idx, body, hdrs, req = fut.result()
             chunks[idx] = body
             if not common_headers:
                 common_headers = hdrs  # use any chunk's headers as canonical
+            if sample_request is None:
+                sample_request = req
     dt = _time.time() - t0
     full_body = b"".join(c for c in chunks if c is not None)
     if len(full_body) != total:
@@ -302,12 +305,15 @@ def parallel_state_get(
     # 4. Synthesize a Response-like object so callers don't care about
     # parallel vs single. httpx.Response constructor accepts content +
     # headers; we strip Range-specific ones the caller doesn't expect.
+    # `request=` is required for the caller's r.raise_for_status() to
+    # work — httpx refuses to format errors without a request context.
     common_headers.pop("content-range", None)
     common_headers["content-length"] = str(len(full_body))
     return httpx.Response(
         status_code=200,
         headers=common_headers,
         content=full_body,
+        request=sample_request,
     )
 
 
