@@ -290,6 +290,68 @@ positive value.
 For Phase 0–1 we're nowhere close (current run is at ~10¹⁷ FLOPs). The
 guardrail matters for the 7B Phase 2 and 70B Phase 3 runs.
 
+## Dynamic world_size (2026-05-27)
+
+`--world-size N` is no longer a fixed quorum target — it's a FLOOR. The
+coord recomputes the effective `world_size` from the count of active
+registrations at safe boundaries and propagates compacted shard
+assignments to workers via DeltaAck.
+
+**Choice A — coord-only quorum tracking**:
+- `_recompute_world_size_locked()` sets `self.world_size = max(min_world_size,
+  len(active workers))`
+- Called from end of `_outer_step_locked` (between rounds, growth-safe)
+  and end of `_evict_stale_workers` (shrinks safe mid-round)
+- **NOT called from `register()`** — bumping quorum mid-round when a new
+  worker has zero in-flight deltas would stall until that worker finished
+  an inner loop. New workers integrate at the next round boundary.
+- `min_workers` clamps dynamically against `world_size` in
+  `_check_and_force_advance` so a cohort that shrank past the original
+  configured min can still force-advance.
+
+**Choice B — worker reshards via DeltaAck**:
+- New `DeltaAck.shard_index` + `DeltaAck.shard_world_size` fields
+- Coord maintains per-worker `shard_index` in `self.workers[wid]`;
+  `_recompute_world_size_locked` compacts indices to a contiguous
+  0..N-1 mapping (sorted by `worker_id` for determinism) every time it
+  fires. A worker leaving the middle of the set causes survivors to
+  shift down — no shard gaps that would skip a slice of train.bin.
+- Every `/delta` response carries the current `(shard_index,
+  shard_world_size)`; worker compares vs its own state and only acts on
+  diffs. Cheap (16 bytes JSON) and avoids server-side change tracking.
+- Worker `_apply_sync_result`: on reassignment, nulls out
+  `train_loader` and calls `_ensure_loader_and_opt` to rebuild on the
+  new partition. The next `run_inner()` reads from the new shard.
+
+**What this enables**:
+- A volunteer can start the desktop client without coord pre-configuration.
+- Cohort grows/shrinks transparently; round cadence tracks reality
+  instead of the launch-time `--world-size` flag.
+- Eviction → automatic compaction → no need for operator restart.
+
+Coverage: 7 tests in `test_coord_api.py`:
+- `test_world_size_initial_matches_floor`
+- `test_world_size_does_not_change_mid_round_on_register` (the stall
+  guard — most important)
+- `test_world_size_grows_at_round_boundary`
+- `test_world_size_shrinks_on_eviction`
+- `test_world_size_respects_min_floor_after_total_evict`
+- `test_delta_ack_carries_shard_assignment` (Choice B)
+- `test_shard_indices_compact_after_eviction` (Choice B)
+
+**Known limitation**: A worker that has been live across a reshard
+event throws away its current `ShardLoader` (and its position in the
+read stream) when the new assignment lands. Next batch comes from the
+start of the worker's new slice → mild re-reading on shard boundary
+transitions. Acceptable for v1.
+
+**Operator notes**:
+- `--world-size 1` is now equivalent to "no minimum"; the coord tracks
+  whatever cohort is actually active.
+- `--world-size 5` floor means a 5-volunteer cohort never collapses
+  below 5-worker quorum even if 4 leave — round just waits for them
+  (or another worker to register) up to `--round-timeout-seconds`.
+
 ## Contributor desktop client (2026-05-27)
 
 PySide6 GUI wrapping `dllm.client.worker` so non-CLI volunteers can

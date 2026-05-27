@@ -702,6 +702,205 @@ def test_flops_alarm_threshold_configurable(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Dynamic world_size (Choice A: coord-only, recompute at round boundaries)
+# ---------------------------------------------------------------------------
+
+
+def _coord_with_floor(min_world_size: int = 1) -> CoordinatorState:
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    return CoordinatorState(
+        preset_name="smoke",
+        world_size=min_world_size,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        # Long inactivity timeout so registrations stick around for the test
+        worker_inactive_timeout_seconds=3600.0,
+        enable_timeout_thread=False,
+    )
+
+
+def test_world_size_initial_matches_floor() -> None:
+    """A fresh coord with --world-size 1 (the floor) starts at world_size=1
+    even before any worker registers, so a sole volunteer can close rounds.
+    """
+    coord = _coord_with_floor(min_world_size=1)
+    client = TestClient(create_app(coord))
+    s = client.get("/status").json()
+    assert s["world_size"] == 1
+    assert s["min_world_size"] == 1
+
+
+def test_world_size_does_not_change_mid_round_on_register() -> None:
+    """Registering a new worker mid-round must NOT bump the quorum target —
+    otherwise an in-flight round would suddenly need a delta from the new
+    worker (which has only just begun its inner loop), stalling forever.
+    """
+    coord = _coord_with_floor(min_world_size=1)
+    client = TestClient(create_app(coord))
+    # Round 0 opens with world_size=1.
+    assert coord.world_size == 1
+    # First worker registers.
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
+    # Second worker registers while round 0 is still open. world_size stays 1.
+    client.post("/register", json=RegisterRequest(pubkey="w1", preset="smoke").model_dump())
+    assert coord.world_size == 1, (
+        "world_size must not auto-bump mid-round; the round would otherwise "
+        "stall waiting on a worker that just joined."
+    )
+
+
+def test_world_size_grows_at_round_boundary() -> None:
+    """When new workers register during round N and the outer step closes
+    round N, world_size recomputes at the round-boundary so round N+1 opens
+    with the correct quorum target.
+    """
+    coord = _coord_with_floor(min_world_size=1)
+    client = TestClient(create_app(coord))
+    # Two workers register during round 0.
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w1", preset="smoke").model_dump())
+    assert coord.world_size == 1  # not yet bumped (still mid-round)
+
+    # Worker 0 submits → since world_size=1, the outer step fires immediately.
+    blob = _build_dummy_blob(coord)
+    ack0 = client.post(
+        "/delta",
+        params={"worker_id": 0, "round": 0, "val_loss": 5.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack0["accepted"]
+    assert ack0["next_round"] == 1
+    # After the outer step bumps the round, world_size recomputes to 2.
+    assert coord.world_size == 2
+    s = client.get("/status").json()
+    assert s["world_size"] == 2
+    assert s["min_world_size"] == 1
+
+
+def test_world_size_shrinks_on_eviction() -> None:
+    """Evicting a stale worker mid-round drops world_size immediately so the
+    remaining workers can close the round at the lower quorum.
+    """
+    import time as _t
+
+    coord = _coord_with_floor(min_world_size=1)
+    coord.world_size = 3  # pretend we're mid-3-worker run
+    now = _t.time()
+    coord.workers = {
+        wid: {"registered_at": now - 60, "last_seen_ts": now}
+        for wid in range(3)
+    }
+    # Worker 2 hasn't been seen for ages → eviction target.
+    coord.workers[2]["last_seen_ts"] = now - 9999
+    coord.worker_inactive_timeout_seconds = 60.0
+    evicted = coord._evict_stale_workers()
+    assert evicted == 1
+    assert coord.world_size == 2, (
+        "after a worker is evicted, world_size must drop so the remaining "
+        "cohort can close the round at the new quorum target"
+    )
+
+
+def test_delta_ack_carries_shard_assignment() -> None:
+    """Choice B: every DeltaAck includes the current (shard_index,
+    shard_world_size). On the very first /delta this matches the worker's
+    registered worker_id — but the worker still gets to see it as the
+    authoritative source.
+    """
+    coord = _coord_with_floor(min_world_size=1)
+    client = TestClient(create_app(coord))
+    # Two workers register. Initial shard assignments (set at register)
+    # are (worker_id, world_size_at_register).
+    for i in range(2):
+        client.post(
+            "/register",
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+        )
+    blob = _build_dummy_blob(coord)
+    ack0 = client.post(
+        "/delta",
+        params={"worker_id": 0, "round": 0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack0["accepted"]
+    assert ack0["shard_index"] == 0
+    # Coord recomputes contiguous indices at outer-step end. Worker 0
+    # was the only submission in round 0, so round 0 closes immediately
+    # with world_size=1 — the next round opens at world_size=2 (two
+    # active workers), and Worker 0's shard becomes (0, 2).
+    assert coord.world_size == 2
+    assert coord.workers[0]["shard_index"] == 0
+    assert coord.workers[0]["shard_world_size"] == 2
+    assert coord.workers[1]["shard_index"] == 1
+    assert coord.workers[1]["shard_world_size"] == 2
+
+
+def test_shard_indices_compact_after_eviction() -> None:
+    """When a worker is evicted from the middle of the active set, surviving
+    workers get re-assigned to a contiguous 0..N-1 index space. Worker 2
+    (id=2) moves from shard_index=2 to shard_index=1 after worker_id=1 is
+    evicted; the train.bin slice it reads thus shifts.
+    """
+    import time as _t
+
+    coord = _coord_with_floor(min_world_size=1)
+    now = _t.time()
+    coord.workers = {
+        wid: {"registered_at": now - 60, "last_seen_ts": now, "shard_index": wid}
+        for wid in range(3)
+    }
+    # Seed initial state as if round had just opened with 3 active workers.
+    coord.world_size = 3
+    coord._recompute_world_size_locked()
+    assert coord.workers[0]["shard_index"] == 0
+    assert coord.workers[1]["shard_index"] == 1
+    assert coord.workers[2]["shard_index"] == 2
+
+    # Worker 1 evicted.
+    coord.workers[1]["last_seen_ts"] = now - 9999
+    coord.worker_inactive_timeout_seconds = 60.0
+    coord._evict_stale_workers()
+    assert 1 not in coord.workers
+    # Survivors compact to (0, 1).
+    assert coord.workers[0]["shard_index"] == 0
+    assert coord.workers[2]["shard_index"] == 1
+    # world_size recomputes to 2 (down from 3).
+    assert coord.world_size == 2
+    # Their shard_world_size also reflects the new total.
+    assert coord.workers[0]["shard_world_size"] == 2
+    assert coord.workers[2]["shard_world_size"] == 2
+
+
+def test_world_size_respects_min_floor_after_total_evict() -> None:
+    """If every worker is evicted, world_size floors at min_world_size rather
+    than collapsing to 0 (which would make even the next registration's
+    sole-volunteer round impossible to close at quorum>=1).
+    """
+    coord = _coord_with_floor(min_world_size=2)
+    assert coord.world_size == 2
+    coord.workers = {
+        wid: {"registered_at": 1.0, "last_seen_ts": 1.0}
+        for wid in range(2)
+    }
+    coord.world_size = 2
+    # All stale; should be evicted.
+    import time as _t
+    for w in coord.workers.values():
+        w["last_seen_ts"] = _t.time() - 9999
+    coord.worker_inactive_timeout_seconds = 60.0
+    coord._evict_stale_workers()
+    # world_size floors at min_world_size=2, even though active count is 0.
+    assert coord.world_size == 2
+
+
 def test_worker_reregister_resumes_with_fresh_id(tmp_path: Path) -> None:
     """When the coord evicts a worker (e.g. inactivity timeout), a fresh
     /delta returns 404. The worker's _reregister_and_resync method should

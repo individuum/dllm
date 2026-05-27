@@ -30,6 +30,12 @@ class RoundStatus(BaseModel):
     n_registered: int
     n_submitted: int
     waiting_for: int  # world_size - n_submitted
+    # Dynamic world_size (Choice A): `world_size` is the live quorum target
+    # for the current round. `min_world_size` is the configured floor it
+    # cannot drop below. `world_size` auto-scales up at round boundaries
+    # when new workers register, and shrinks immediately on auto-evict.
+    world_size: int = 1
+    min_world_size: int = 1
     last_val_loss: float | None = None  # mean val loss across workers from the previous round
     flops_total: float = 0.0  # cumulative training FLOPs estimate
     flops_alarm_threshold: float = 0.0  # 0 = disabled; >0 = warn when flops_total ≥ this
@@ -80,3 +86,11 @@ class DeltaAck(BaseModel):
     # `inner_steps` from the worker's reported tokens_per_sec, it returns it
     # here. Worker applies on the NEXT round. None = no change.
     inner_steps: int | None = None
+    # Dynamic shard reassignment (Choice B): when world_size changes the
+    # coord recomputes a contiguous 0..world_size-1 shard_index per active
+    # worker (separate from worker_id, which is stable). Worker rebuilds
+    # its ShardLoader with the new (shard_index, shard_world_size) on the
+    # next round so disjoint slices stay disjoint as the cohort grows or
+    # shrinks. None on either field = no change.
+    shard_index: int | None = None
+    shard_world_size: int | None = None

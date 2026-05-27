@@ -895,7 +895,13 @@ async function refresh() {
     document.getElementById("open").textContent =
       `${fmtSeconds(status.round_open_seconds)} / timeout ${fmtSeconds(status.round_timeout_seconds)}`;
     document.getElementById("quorum").textContent =
-      `${status.n_submitted} submitted · ${status.waiting_for} pending · min_workers=${status.min_workers}`;
+      `${status.n_submitted} submitted · ${status.waiting_for} pending · min_workers=${status.min_workers}` +
+      (status.world_size != null
+        ? ` · world_size=${status.world_size}` +
+          (status.min_world_size != null && status.min_world_size < status.world_size
+            ? ` (auto-scaled from floor ${status.min_world_size})`
+            : ` (floor)`)
+        : "");
     document.getElementById("timeout").textContent =
       `force-advance after ${fmtSeconds(status.round_timeout_seconds)} if ≥${status.min_workers} delta(s) in`;
     // Tier-aware indicator: when on, every worker gets a per-worker

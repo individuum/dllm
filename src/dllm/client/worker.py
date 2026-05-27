@@ -302,6 +302,12 @@ class Worker:
         self.seed: int = 0
         self.state_codec: str = "bf16"
         self.delta_codec: str = "q8"
+        # Dynamic sharding (Choice B). On register these default to
+        # (worker_id, world_size) so legacy single-worker behaviour is
+        # unchanged. When the coord re-balances the cohort it sends new
+        # values in DeltaAck; we rebuild the train_loader between rounds.
+        self.shard_index: int = 0
+        self.shard_world_size: int = 1
 
         self.train_loader: ShardLoader | None = None
         self.val_loader: ShardLoader | None = None
@@ -345,6 +351,11 @@ class Worker:
         self.seed = data["seed"]
         self.state_codec = data.get("state_codec", "bf16")
         self.delta_codec = data.get("delta_codec", "q8")
+        # Dynamic sharding: default to (worker_id, world_size) so the first
+        # round reads a sensible slice; the coord can re-balance via
+        # DeltaAck when the cohort changes.
+        self.shard_index = self.worker_id
+        self.shard_world_size = self.world_size
         log.info(
             "registered worker_id=%d round=%d world_size=%d inner=%d codecs=%s/%s",
             self.worker_id,
@@ -358,12 +369,21 @@ class Worker:
     def _ensure_loader_and_opt(self) -> None:
         if self.train_loader is None:
             assert self.worker_id is not None
+            # ShardLoader partitions by (shard_index, shard_world_size).
+            # These default to (worker_id, world_size) on register but are
+            # mutated when the coord re-balances the cohort — _build_train_loader
+            # is the one place that needs to read them, so we can rebuild
+            # cleanly when they change. `getattr` fallbacks keep older test
+            # paths working (some tests instantiate Worker via `object.__new__`
+            # and skip `__init__`).
+            shard_idx = getattr(self, "shard_index", self.worker_id)
+            shard_ws = getattr(self, "shard_world_size", self.world_size)
             self.train_loader = ShardLoader(
                 self.train_data,
                 seq_len=self.seq_len,
                 batch_size=self.micro_batch_size,
-                worker_id=self.worker_id,
-                world_size=self.world_size,
+                worker_id=shard_idx,
+                world_size=shard_ws,
                 device=self.device,
                 seed=self.seed,
             )
@@ -614,6 +634,11 @@ class Worker:
         # _apply_sync_result can hand it to the main loop (which applies it
         # AT THE START of the next round — never mid-inner-loop).
         new_inner = ack.get("inner_steps")
+        # Dynamic sharding: coord may have re-assigned this worker's shard
+        # partition (e.g. another worker joined or got evicted). Same
+        # contract as inner_steps — applied between rounds, never mid-loop.
+        new_shard_index = ack.get("shard_index")
+        new_shard_world_size = ack.get("shard_world_size")
         if not ack.get("accepted"):
             # Stale-round rejection: in heterogeneous fleets, fast workers can
             # advance the coord past where we submitted. Don't bail — fetch the
@@ -635,6 +660,8 @@ class Worker:
                     "state_bytes": len(r2.content),
                     "resync": True,
                     "inner_steps": new_inner,
+                    "shard_index": new_shard_index,
+                    "shard_world_size": new_shard_world_size,
                 }
             return {
                 "ack": ack,
@@ -642,6 +669,8 @@ class Worker:
                 "round": round_no,
                 "state_bytes": 0,
                 "inner_steps": new_inner,
+                "shard_index": new_shard_index,
+                "shard_world_size": new_shard_world_size,
             }
 
         target = ack.get("next_round")
@@ -669,6 +698,8 @@ class Worker:
             "round": int(r2.headers["x-round"]),
             "state_bytes": len(r2.content),
             "inner_steps": new_inner,
+            "shard_index": new_shard_index,
+            "shard_world_size": new_shard_world_size,
         }
 
     def _apply_sync_result(self, result: dict) -> bool:
@@ -706,6 +737,28 @@ class Worker:
                 new_inner,
             )
             self.inner_steps = int(new_inner)
+        # Dynamic sharding: same between-rounds contract as inner_steps. If
+        # the coord reassigned our shard (cohort grew/shrank), throw away
+        # the current train_loader and rebuild on the new partition. The
+        # next run_inner() will hit `if self.train_loader is None:` in
+        # _ensure_loader_and_opt and rebuild with self.shard_index /
+        # self.shard_world_size.
+        new_si = result.get("shard_index")
+        new_sws = result.get("shard_world_size")
+        if (new_si is not None and new_sws is not None
+                and (new_si != self.shard_index or new_sws != self.shard_world_size)):
+            log.warning(
+                "[RESHARD] coord reassigned shard (%d/%d -> %d/%d); "
+                "rebuilding train_loader",
+                self.shard_index,
+                self.shard_world_size,
+                new_si,
+                new_sws,
+            )
+            self.shard_index = int(new_si)
+            self.shard_world_size = int(new_sws)
+            self.train_loader = None  # _ensure_loader_and_opt rebuilds on next call
+            self._ensure_loader_and_opt()
         log.info(
             "async sync applied round=%d (%d state bytes)%s",
             self.current_round,

@@ -84,7 +84,14 @@ class CoordinatorState:
         self.preset_name = preset_name
         self.cfg: ModelConfig = PRESETS[preset_name]
         self.train_cfg = train_cfg
-        self.world_size = world_size
+        # Dynamic world_size (Choice A): `world_size` arg is now the FLOOR.
+        # Actual quorum target tracks len(active workers) at round boundaries.
+        # min_world_size=1 + zero workers = world_size 1 = round just waits.
+        # min_world_size=2 + one worker = world_size 2 = round waits for a
+        # second registration before quorum can close (legacy behaviour at
+        # `--world-size 2`).
+        self.min_world_size = max(1, world_size)
+        self.world_size = self.min_world_size
         self.device = torch.device(device)
         self.state_codec: StateCodec = state_codec
         self.delta_codec: DeltaCodec = delta_codec
@@ -354,6 +361,12 @@ class CoordinatorState:
                 # Clear any unconsumed delta in the current round so the
                 # outer step's quorum check reflects the surviving cohort.
                 self.deltas.get(self.round, {}).pop(wid, None)
+            if to_evict:
+                # Dynamic world_size: shrinking mid-round is safe and
+                # desired — lets the remaining workers close the round at
+                # the lower quorum instead of waiting on a dead peer until
+                # `round_timeout_seconds` fires.
+                self._recompute_world_size_locked()
             return len(to_evict)
 
     def _check_and_force_advance(self) -> bool:
@@ -367,18 +380,23 @@ class CoordinatorState:
             submitted = len(self.deltas.get(self.round, {}))
             if elapsed < self.round_timeout_seconds:
                 return False
-            if submitted < self.min_workers:
+            # min_workers is clamped DYNAMICALLY against current world_size.
+            # Without this clamp, a cohort that shrank below the original
+            # min_workers floor (e.g. configured for 5, now down to 2) would
+            # never force-advance even though all surviving peers submitted.
+            effective_min = max(1, min(self.min_workers, self.world_size))
+            if submitted < effective_min:
                 return False  # too few deltas — keep waiting (e.g. all workers offline)
             if submitted >= self.world_size:
                 return False  # the regular path will handle this on the submitting thread
             log.warning(
-                "[TIMEOUT] forcing outer step at round=%d with %d/%d deltas after %.1fs (timeout=%.1fs, min_workers=%d)",
+                "[TIMEOUT] forcing outer step at round=%d with %d/%d deltas after %.1fs (timeout=%.1fs, effective_min=%d)",
                 self.round,
                 submitted,
                 self.world_size,
                 elapsed,
                 self.round_timeout_seconds,
-                self.min_workers,
+                effective_min,
             )
             self._outer_step_locked()
             return True
@@ -423,6 +441,54 @@ class CoordinatorState:
             )
         return 6.0 * n_params * toks_per_round
 
+    # -- dynamic world_size (Choice A: coord-only auto-scaling) ---------------
+
+    def _recompute_world_size_locked(self) -> int:
+        """Recompute self.world_size from the count of active registrations.
+
+        Floor: self.min_world_size (set at startup). Eviction may briefly
+        bring the active count below the floor; the floor wins so a freshly
+        booted coord with zero workers still has world_size=1 (matches the
+        legacy single-worker behaviour at `--world-size 1`).
+
+        Also reassigns per-worker shard_index to a contiguous 0..N-1 mapping
+        (Choice B). Workers learn the new assignment via DeltaAck on their
+        next /delta and rebuild their ShardLoader accordingly. The
+        reassignment ALWAYS runs (even when world_size is unchanged) because
+        a worker leaving still leaves a hole in the index space that the
+        survivors should compact away.
+
+        Call ONLY at safe boundaries:
+            - end of `_outer_step_locked` (between rounds)
+            - end of `_evict_stale_workers` (shrinks are safe mid-round)
+
+        NEVER call from `register()` — bumping the quorum target mid-round
+        when a new worker has zero in-flight deltas would stall the round
+        until that worker also finished an inner loop.
+
+        Returns the new world_size (== self.world_size). Caller holds lock.
+        """
+        new_size = max(self.min_world_size, len(self.workers))
+        size_changed = new_size != self.world_size
+        if size_changed:
+            old = self.world_size
+            self.world_size = new_size
+            log.info(
+                "[WORLD_SIZE] %d -> %d (auto-scaled, active workers=%d, floor=%d)",
+                old,
+                new_size,
+                len(self.workers),
+                self.min_world_size,
+            )
+        # Compact shard_indices to 0..N-1 regardless of whether world_size
+        # changed. Sorted by worker_id so the assignment is deterministic
+        # across coord restarts (and across worker reads of /workers).
+        active_wids = sorted(self.workers.keys())
+        for idx, wid in enumerate(active_wids):
+            self.workers[wid]["shard_index"] = idx
+            self.workers[wid]["shard_world_size"] = self.world_size
+        return new_size
+
     # -- API used by FastAPI handlers ----------------------------------------
 
     def register(self, req: RegisterRequest) -> RegisterResponse:
@@ -447,6 +513,12 @@ class CoordinatorState:
             self.next_worker_id += 1
             # Per-worker inner_steps: starts at the global default and gets
             # retuned by submit_delta() once the worker reports tokens_per_sec.
+            #
+            # shard_index: assigned by _recompute_world_size_locked() at the
+            # next round boundary. Initialized to wid for the worker's first
+            # round so the very first inner loop has a sensible shard
+            # partition; gets a contiguous remap (so eviction doesn't leave
+            # gaps in the shard space) at next outer-step end.
             self.workers[wid] = {
                 "pubkey_hex": req.pubkey,
                 "pubkey": parsed_pubkey,
@@ -456,6 +528,8 @@ class CoordinatorState:
                 "ram_gb": req.ram_gb,
                 "registered_at": time.time(),
                 "inner_steps": self.train_cfg.inner_steps,
+                "shard_index": wid,
+                "shard_world_size": self.world_size,
             }
             log.info(
                 "register worker=%d country=%s gpu=%s preset=%s",
@@ -485,6 +559,8 @@ class CoordinatorState:
                 n_registered=len(self.workers),
                 n_submitted=n_sub,
                 waiting_for=max(0, self.world_size - n_sub),
+                world_size=self.world_size,
+                min_world_size=self.min_world_size,
                 last_val_loss=self.last_val_loss,
                 flops_total=self.flops_total,
                 flops_alarm_threshold=self.flops_alarm_threshold,
@@ -518,6 +594,8 @@ class CoordinatorState:
                     "last_power_watts": w.get("last_power_watts"),
                     "last_tokens_per_sec": w.get("last_tokens_per_sec"),
                     "inner_steps": w.get("inner_steps"),
+                    "shard_index": w.get("shard_index"),
+                    "shard_world_size": w.get("shard_world_size"),
                 }
                 for wid, w in sorted(self.workers.items())
             ]
@@ -593,13 +671,29 @@ class CoordinatorState:
             # target_round_seconds. Only return a new value when the change is
             # material (avoid dashboard churn on noise).
             new_inner = self._maybe_retune_worker(worker_id, tokens_per_sec)
+            # Dynamic sharding (Choice B): always send the current shard
+            # assignment in the ack so the worker can detect changes and
+            # rebuild its ShardLoader on its next round if needed. Cheap
+            # (16 bytes JSON); the worker is the one that compares to its
+            # own state and only acts on diffs.
+            shard_index = ws.get("shard_index")
+            shard_world_size = ws.get("shard_world_size")
             ready = len(self.deltas[self.round]) >= self.world_size
             if ready:
                 self._outer_step_locked()
                 return DeltaAck(
-                    accepted=True, next_round=self.round, inner_steps=new_inner
+                    accepted=True,
+                    next_round=self.round,
+                    inner_steps=new_inner,
+                    shard_index=shard_index,
+                    shard_world_size=shard_world_size,
                 )
-            return DeltaAck(accepted=True, inner_steps=new_inner)
+            return DeltaAck(
+                accepted=True,
+                inner_steps=new_inner,
+                shard_index=shard_index,
+                shard_world_size=shard_world_size,
+            )
 
     def _maybe_retune_worker(
         self, worker_id: int, tokens_per_sec: float | None
@@ -729,6 +823,10 @@ class CoordinatorState:
         self.tokens_per_sec_per_round.pop(prev_round, None)
         self.round_started_at = time.time()
         self._invalidate_state_cache()
+        # Dynamic world_size: pick up any registrations that arrived during
+        # the round just closed (we deliberately didn't bump mid-round to
+        # avoid stalling the quorum target).
+        self._recompute_world_size_locked()
 
         # record for the dashboard's chart (persisted to disk)
         self._append_history(
