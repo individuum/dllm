@@ -33,7 +33,7 @@ CMD [ \
     "--require-signed-deltas", \
     "--round-timeout-seconds", "1800", \
     "--min-workers", "1", \
-    "--worker-inactive-timeout-seconds", "3600", \
+    "--worker-inactive-timeout-seconds", "600", \
     "--max-active-workers", "4", \
     "--tier-aware", \
     "--target-round-seconds", "300", \
