@@ -1036,6 +1036,59 @@ def test_world_size_respects_min_floor_after_total_evict() -> None:
     assert coord.world_size == 2
 
 
+def test_async_sync_io_signals_dropped_on_signature_mismatch() -> None:
+    """Coord restart race: another worker grabs our old worker_id, our /delta
+    arrives with the wrong pubkey for that id → coord returns 200 OK with
+    accepted=false, reason="signature verification failed". Worker should
+    treat this as "registration stale" (same as HTTP 404) and signal
+    `dropped: True` so run() triggers _reregister_and_resync — NOT bail.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from dllm.client.worker import Worker, pick_device
+    from dllm.shared.identity import load_or_create_identity
+
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+    )
+    # We construct a Worker but exercise _async_sync_io directly with a
+    # mocked http client that returns the signature-failure shape.
+    w = object.__new__(Worker)
+    w.coord_url = "http://testserver"
+    w.worker_id = 0
+    w.state_codec = "fp32"
+    w.delta_codec = "fp32"
+    w.sk = load_or_create_identity()  # any key; we mock the POST
+    # Mocked http.post returns a response with 200 + signature-failure body.
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {
+        "accepted": False,
+        "reason": "signature verification failed",
+        "next_round": None,
+        "inner_steps": None,
+        "shard_index": None,
+        "shard_world_size": None,
+    }
+    fake_response.raise_for_status = MagicMock()
+    w.http = MagicMock()
+    w.http.post = MagicMock(return_value=fake_response)
+    w.http.get = MagicMock()  # should not be called on the dropped path
+
+    result = w._async_sync_io(b"\x00" * 16, val_loss=1.0, round_no=42)
+    assert result.get("dropped") is True, (
+        "signature-mismatch must signal dropped=True so run() re-registers; "
+        f"got result={result}"
+    )
+    # And we must NOT have called /state after the rejection — the dropped
+    # path is supposed to bounce back to run() immediately.
+    assert w.http.get.call_count == 0
+
+
 def test_worker_reregister_resumes_with_fresh_id(tmp_path: Path) -> None:
     """When the coord evicts a worker (e.g. inactivity timeout), a fresh
     /delta returns 404. The worker's _reregister_and_resync method should

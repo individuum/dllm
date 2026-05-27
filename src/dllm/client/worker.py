@@ -671,6 +671,27 @@ class Worker:
         new_shard_index = ack.get("shard_index")
         new_shard_world_size = ack.get("shard_world_size")
         if not ack.get("accepted"):
+            reason = ack.get("reason", "")
+            # Signature mismatch = our worker_id is now bound to someone else's
+            # pubkey on the coord (typical after coord restart + another worker
+            # grabbed the freed-up id before we did). Treat as "we're stale —
+            # re-register". Same contract as the 404 path; the dropped flag
+            # tells run() to fire _reregister_and_resync.
+            if "signature" in reason.lower():
+                log.error(
+                    "POST /delta -> accepted=False, reason=%r — worker_id=%s "
+                    "is no longer ours on the coord (likely restart race). "
+                    "Re-registering.",
+                    reason,
+                    self.worker_id,
+                )
+                return {
+                    "ack": ack,
+                    "state": None,
+                    "round": round_no,
+                    "state_bytes": 0,
+                    "dropped": True,
+                }
             # Stale-round rejection: in heterogeneous fleets, fast workers can
             # advance the coord past where we submitted. Don't bail — fetch the
             # current consensus state and re-align. The caller (_apply_sync_result)
