@@ -267,8 +267,12 @@ class Worker:
         self.target_round_seconds = target_round_seconds
         self.power_meter = PowerMeter(device, override_watts=estimated_watts)
 
-        # Ed25519 identity — persisted in .dllm/identity.key
-        self.sk = load_or_create_identity()
+        # Ed25519 identity. Default: <repo_root>/.dllm/identity.key (legacy,
+        # for `dllm-worker` runs from the repo). Desktop client sets
+        # DLLM_IDENTITY_KEY to a per-user path so the same volunteer's
+        # identity persists across upgrades / cwd changes / reinstalls.
+        identity_override = os.environ.get("DLLM_IDENTITY_KEY")
+        self.sk = load_or_create_identity(identity_override)
         self.pubkey_hex = pubkey_hex(self.sk)
         log.info("identity pubkey: %s", self.pubkey_hex[:16] + "...")
 

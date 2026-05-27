@@ -37,11 +37,19 @@ data = [
     "datasets>=2.20",
     "tokenizers>=0.20",
 ]
+# `[desktop]` extras are only needed for the contributor GUI shipped via
+# `dllm-desktop` / the PyInstaller bundle. Coord and CLI worker pull none
+# of this — the GUI is purely a convenience layer over `dllm.client.worker`.
+desktop = [
+    "PySide6>=6.7",
+]
 
 [project.scripts]
 dllm-coord = "dllm.coord.server:main"
 dllm-worker = "dllm.client.worker:main"
+dllm-desktop = "dllm.desktop.main:main"
 dllm-prepare = "dllm.data.prepare:main"
+dllm-sft-prepare = "dllm.data.sft_prepare:main"
 dllm-smoke = "dllm.scripts.smoke_test:main"
 
 [tool.setuptools.packages.find]

@@ -290,6 +290,52 @@ positive value.
 For Phase 0–1 we're nowhere close (current run is at ~10¹⁷ FLOPs). The
 guardrail matters for the 7B Phase 2 and 70B Phase 3 runs.
 
+## Contributor desktop client (2026-05-27)
+
+PySide6 GUI wrapping `dllm.client.worker` so non-CLI volunteers can
+contribute. Lives at [src/dllm/desktop/](src/dllm/desktop/). Install via
+`pip install -e .[desktop]`, launch with `dllm-desktop` (or `python -m
+dllm.desktop.main`).
+
+**Architecture**:
+- `main.py` — entry point. Detects `--worker-mode` shim for future
+  PyInstaller bundle (frozen binary re-execs itself as the worker
+  subprocess instead of relying on `python -m`).
+- `main_window.py` — `MainWindow`: country picker, preset picker,
+  Start/Stop, 4 metric tiles (round, val_loss, throughput, power), log
+  pane with 2000-line ring buffer.
+- `worker_runner.py` — `WorkerRunner(QObject)`: wraps `QProcess` running
+  the worker subprocess; parses well-known log lines into Qt signals
+  (`registered`, `inner_completed`, `val_reported`, `sync_applied`,
+  `retune_applied`, `reregistered`, `power_sample`).
+- `paths.py` — per-user data + log dirs (Windows %APPDATA%, macOS
+  ~/Library/Application Support, Linux XDG). Identity key persists at
+  `<data_dir>/identity.key` instead of cwd-relative
+  `./.dllm/identity.key` — survives reinstalls + cwd changes.
+
+**Identity migration**: the CLI worker now honors `DLLM_IDENTITY_KEY`
+env var (additive to `load_or_create_identity(path)`), which the desktop
+client sets to the per-user path. Backward compatible — CLI users
+without the env var keep using `./.dllm/identity.key`.
+
+**Test coverage**: 7 regex tests in `test_desktop_runner.py` lock down
+the log-line → signal contract. PySide6 is `importorskip`-gated so the
+test module just skips on core-only installs.
+
+**PyInstaller bundle** lives at [packaging/desktop/dllm_desktop.spec](packaging/desktop/dllm_desktop.spec).
+One-folder mode (PyTorch CUDA + Qt resist single-file packing). Build with
+`pyinstaller packaging/desktop/dllm_desktop.spec --clean --noconfirm`. Output
+is ~2 GB on Windows. v0 unsigned; signing + auto-update are Phase 1 wrap-up.
+
+**What's missing for full Phase 1 (volunteer-facing release)**:
+- Coord-side `/shard?worker_id=N&world_size=K` endpoint so the GUI
+  doesn't require a pre-existing local `data/cache/train.bin` (12 GB)
+- System tray / menu-bar integration (pause/resume from the dock)
+- Code signing (Authenticode + Apple notarization)
+- Auto-update (Sparkle on macOS, Squirrel on Windows)
+- Brand icon
+- License + residency-attestation flow (placeholder for eIDAS later)
+
 ## Pointers
 
 - Architecture + roadmap: [PLAN.md](PLAN.md) (Phase 0/1/2, EU compliance, tier-aware scheduling).
