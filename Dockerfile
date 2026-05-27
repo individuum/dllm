@@ -25,14 +25,14 @@ CMD [ \
     "--port", "8000", \
     "--preset", "300M", \
     "--world-size", "1", \
-    "--inner-steps", "400", \
+    "--inner-steps", "200", \
     "--seq-len", "4096", \
     "--micro-batch-size", "2", \
     "--checkpoint-dir", "/data/checkpoints", \
     "--checkpoint-every", "3", \
     "--require-signed-deltas", \
-    "--round-timeout-seconds", "900", \
+    "--round-timeout-seconds", "1800", \
     "--min-workers", "1", \
-    "--worker-inactive-timeout-seconds", "1200", \
+    "--worker-inactive-timeout-seconds", "3600", \
     "--device", "cpu" \
 ]
