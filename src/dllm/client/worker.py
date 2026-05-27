@@ -251,9 +251,14 @@ class Worker:
         auto_tune_steps: bool = False,
         target_round_seconds: float = 90.0,
         estimated_watts: float | None = None,
+        micro_batch_size_override: int | None = None,
     ) -> None:
         self.coord_url = coord_url.rstrip("/")
         self.preset = preset
+        # VRAM-constrained GPUs (Colab T4, smaller cards) can override the
+        # coord's micro_batch_size downward. Used by register() to clamp
+        # the value coming back from /register. None = use coord's value.
+        self.micro_batch_size_override = micro_batch_size_override
         self.country = country
         self.device = device
         self.train_data = train_data
@@ -362,7 +367,18 @@ class Worker:
         self.current_round = data["current_round"]
         self.inner_steps = data["inner_steps"]
         self.seq_len = data["seq_len"]
-        self.micro_batch_size = data["micro_batch_size"]
+        coord_batch = int(data["micro_batch_size"])
+        if self.micro_batch_size_override is not None and self.micro_batch_size_override < coord_batch:
+            self.micro_batch_size = int(self.micro_batch_size_override)
+            log.warning(
+                "[BATCH-OVERRIDE] coord said micro_batch=%d; "
+                "this worker uses %d (VRAM-constrained). FLOPs accounting "
+                "may slightly under-count this worker's contribution.",
+                coord_batch,
+                self.micro_batch_size,
+            )
+        else:
+            self.micro_batch_size = coord_batch
         self.seed = data["seed"]
         self.state_codec = data.get("state_codec", "bf16")
         self.delta_codec = data.get("delta_codec", "q8")
@@ -941,6 +957,17 @@ def main() -> None:
             "Default: NVML on CUDA if installed; VRAM-tier / TDP estimate otherwise."
         ),
     )
+    ap.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Override the coord's micro_batch_size for THIS worker (VRAM-"
+            "constrained GPUs like Colab T4 may need 1 even if the cohort "
+            "default is 2). Override is one-way: can only DECREASE the "
+            "value. FLOPs accounting will slightly under-count this worker."
+        ),
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -972,6 +999,7 @@ def main() -> None:
         auto_tune_steps=args.auto_tune_steps,
         target_round_seconds=args.target_round_seconds,
         estimated_watts=args.estimated_watts,
+        micro_batch_size_override=args.micro_batch_size,
     )
     w.run(max_rounds=args.max_rounds)
 
