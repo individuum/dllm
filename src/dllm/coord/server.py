@@ -110,6 +110,16 @@ class CoordinatorState:
 
         torch.manual_seed(train_cfg.seed)
         self.model = Transformer(self.cfg).to(self.device)
+        # Coord stores the consensus model in bf16. Halves model + SGD
+        # momentum-buffer memory vs fp32 (1.25 GB → 600 MB each for 300M
+        # params), critical on the 8 GB VPS. Workers receive bf16 state
+        # over the wire anyway (state_codec defaults to bf16), and the
+        # DiLoCo outer step's accuracy is robust to bf16 momentum at
+        # outer_lr=0.7 + momentum=0.9 (DiLoCo paper §5).
+        # Init in fp32 first so the random init is bit-identical with
+        # workers' models (which also init fp32 then autocast to bf16),
+        # then convert in-place to bf16 for residency.
+        self.model.to(torch.bfloat16)
         self.outer_opt = torch.optim.SGD(
             self.model.parameters(),
             lr=train_cfg.outer_lr,
