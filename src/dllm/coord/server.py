@@ -530,8 +530,23 @@ class CoordinatorState:
     # -- outer optimizer step (caller holds lock) -----------------------------
 
     def _outer_step_locked(self) -> None:
+        # Free the cached serialized state blob (~600 MB at bf16 for 300M)
+        # before we do the memory-hungry delta averaging. The next /state
+        # call after this outer step would invalidate it anyway; doing it
+        # eagerly buys us ~600 MB of headroom during the peak.
+        self._invalidate_state_cache()
+        # Memory note: at this point self.deltas[self.round] holds N×P fp32
+        # tensors (~1.25 GB per delta for the 300M model). After we extract
+        # the average, we don't need the per-worker copies — so we drop them
+        # AFTER averaging but BEFORE the optimizer step to keep peak memory
+        # off the OOM-killer's radar on small VPSes.
         round_deltas = list(self.deltas[self.round].values())
+        n_deltas_in_round = len(round_deltas)  # captured before we free the list
         avg = average_deltas(round_deltas)
+        # Free the per-worker delta tensors immediately; the averaged copy
+        # in `avg` is the only thing the outer step still needs.
+        del round_deltas
+        self.deltas[self.round].clear()
 
         self.outer_opt.zero_grad(set_to_none=True)
         with torch.no_grad():
@@ -540,8 +555,17 @@ class CoordinatorState:
                     continue
                 if n not in avg:
                     raise KeyError(f"missing delta for parameter {n!r}")
-                g = avg[n].to(p.device, dtype=p.dtype)
-                p.grad = g
+                # If model dtype matches avg dtype, .to() returns the same
+                # tensor (no copy). Otherwise it allocates once.
+                p.grad = avg[n].to(p.device, dtype=p.dtype)
+        # Capture the flat-norm summary before we free `avg` — the log line
+        # below needs it for debugging.
+        avg_norm = _flat_norm(avg)
+        # avg is no longer needed — the gradients are attached to p.grad
+        # which the optimizer will consume. Drop the dict to free the fp32
+        # buffers before SGD's momentum-buffer update fires.
+        avg.clear()
+        del avg
         self.outer_opt.step()
 
         # bookkeeping
@@ -604,7 +628,7 @@ class CoordinatorState:
                 "power_watts_per_worker": mean_power,
                 "tokens_per_sec": total_tok_s,
                 "energy_wh_total": self.energy_wh_total,
-                "n_workers": len(round_deltas),
+                "n_workers": n_deltas_in_round,
                 "n_reporting_workers": n_reporting,
             }
         )
@@ -613,7 +637,7 @@ class CoordinatorState:
             "outer step %d -> %d (avg delta norm: %.4f, FLOPs ~%.2e, last_val_loss=%s%s%s)",
             prev_round,
             self.round,
-            _flat_norm(avg),
+            avg_norm,
             self.flops_total,
             f"{self.last_val_loss:.4f}" if self.last_val_loss is not None else "n/a",
             f", power={mean_power:.0f}W" if mean_power is not None else "",
