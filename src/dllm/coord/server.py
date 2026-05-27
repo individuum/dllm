@@ -38,7 +38,7 @@ except AttributeError:
 
 from ..core import PRESETS, ModelConfig, Transformer
 from ..core.config import TrainConfig
-from ..shared.identity import pubkey_from_hex, verify_delta
+from ..shared.identity import pubkey_from_hex, verify_delta, verify_deregister
 from ..shared.protocol import DeltaAck, RegisterRequest, RegisterResponse, RoundStatus
 from ..shared.serialize import (
     DeltaCodec,
@@ -586,6 +586,59 @@ class CoordinatorState:
                 require_signed_deltas=self.require_signed_deltas,
             )
 
+    # -- voluntary deregister ---------------------------------------------
+
+    def deregister(
+        self, worker_id: int, ts_unix: int, signature_b64: str
+    ) -> dict:
+        """Worker voluntarily leaves the cohort (clean Ctrl+C / Colab stop
+        / atexit). Signed with the worker's Ed25519 key so peer A can't
+        kick peer B off the coord.
+
+        Coord rejects replayed signatures older than 5 min — narrow window
+        keeps clock skew tolerable without exposing the endpoint to
+        long-term replay.
+
+        Caller does not hold lock.
+        """
+        with self.lock:
+            ws = self.workers.get(worker_id)
+            if ws is None:
+                # Already gone (auto-evicted, prior deregister, never
+                # registered). Idempotent — return success.
+                return {"removed": False, "reason": "not registered"}
+
+            # Replay-protection: ts must be within ±300s of now.
+            now = int(time.time())
+            if abs(now - ts_unix) > 300:
+                raise HTTPException(
+                    400,
+                    f"timestamp drift too large: {ts_unix} vs server {now}",
+                )
+
+            pubkey = ws.get("pubkey")
+            if self.require_signed_deltas:
+                if pubkey is None:
+                    raise HTTPException(401, "worker registered without pubkey")
+                if not verify_deregister(pubkey, worker_id, ts_unix, signature_b64):
+                    raise HTTPException(401, "signature verification failed")
+
+            log.info(
+                "[DEREGISTER] worker_id=%d voluntarily left (country=%s gpu=%s)",
+                worker_id,
+                ws.get("country", "??"),
+                ws.get("gpu", "??"),
+            )
+            del self.workers[worker_id]
+            # If the worker had submitted a delta in the current round but the
+            # round hasn't closed, drop the delta so quorum reflects who's
+            # actually still around.
+            self.deltas.get(self.round, {}).pop(worker_id, None)
+            # Recompute world_size on the way out so the surviving cohort can
+            # close the current round at the new (smaller) quorum.
+            self._recompute_world_size_locked()
+            return {"removed": True}
+
     def status(self) -> RoundStatus:
         with self.lock:
             n_sub = len(self.deltas.get(self.round, {}))
@@ -958,6 +1011,11 @@ def create_app(state: CoordinatorState) -> FastAPI:
     @app.post("/register", response_model=RegisterResponse)
     def register(req: RegisterRequest) -> RegisterResponse:
         return state.register(req)
+
+    @app.post("/deregister")
+    def deregister(worker_id: int, ts: int, signature: str = "") -> dict:
+        """Worker voluntarily leaves. Signed; idempotent."""
+        return state.deregister(worker_id, ts, signature)
 
     @app.get("/status", response_model=RoundStatus)
     def status() -> RoundStatus:

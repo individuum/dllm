@@ -6,6 +6,7 @@ reporting back to coord.
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import os
 import sys
@@ -29,6 +30,7 @@ from ..shared.identity import (
     load_or_create_identity,
     pubkey_hex,
     sign_delta,
+    sign_deregister,
 )
 from ..shared.protocol import RegisterRequest
 from ..shared.serialize import (
@@ -1024,11 +1026,65 @@ class Worker:
             old_wid,
         )
 
+    # -- voluntary deregister ------------------------------------------------
+
+    def _safe_deregister(self) -> None:
+        """Best-effort POST /deregister to free the slot on the coord.
+
+        Fires on:
+          - normal exit at end of run()
+          - KeyboardInterrupt (Ctrl+C, Colab cell stop)
+          - any exception propagating out of run()
+          - sys.exit() / interpreter shutdown (atexit)
+
+        Does NOT fire on SIGKILL, kernel crash, or browser tab close
+        without graceful kernel shutdown — those still rely on the
+        coord's worker_inactive_timeout to auto-evict.
+
+        Idempotent: safe to call multiple times. Already-deregistered
+        case is handled coord-side by returning {removed: False} without
+        an error.
+        """
+        if self.worker_id is None:
+            return
+        wid = self.worker_id
+        try:
+            ts = int(time.time())
+            sig = sign_deregister(self.sk, wid, ts)
+            r = self.http.post(
+                "/deregister",
+                params={"worker_id": wid, "ts": ts, "signature": sig},
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                log.info("deregistered worker_id=%d cleanly", wid)
+            else:
+                log.warning(
+                    "deregister returned %d (body=%r); coord auto-evict will clean up",
+                    r.status_code,
+                    r.text[:200],
+                )
+        except Exception as exc:  # noqa: BLE001  — best-effort; never fail shutdown
+            log.warning(
+                "deregister failed (%s); coord auto-evict will clean up",
+                exc,
+            )
+        finally:
+            # Mark as gone locally so a second call (atexit AFTER finally)
+            # doesn't double-fire.
+            self.worker_id = None
+
     # -- top-level loop -------------------------------------------------------
 
     def run(self, max_rounds: int) -> None:
         """Lazy-async DiLoCo: GPU runs continuously; network exchanges overlap."""
         self.register()
+        # Register the deregister hook as soon as we have a worker_id so
+        # ANY exit path (KeyboardInterrupt, exception, sys.exit, atexit)
+        # frees the coord-side slot. The try/finally below also calls it
+        # explicitly for the common case so we don't depend on atexit
+        # firing during pytest / embedded usage.
+        atexit.register(self._safe_deregister)
         self.pull_state()  # captures last_ref
         self._ensure_loader_and_opt()
 
@@ -1105,6 +1161,10 @@ class Worker:
                 if self._apply_sync_result(pending.result()):
                     rounds_committed += 1
         finally:
+            # Deregister BEFORE shutting down the executor so the HTTP
+            # call has a working thread pool. Best-effort; coord-side
+            # auto-evict is the safety net.
+            self._safe_deregister()
             self._exec.shutdown(wait=False)
             self.power_meter.close()
 

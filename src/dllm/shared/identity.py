@@ -27,8 +27,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-# canonical signed message:  f"dllm-delta:{worker_id}:{round}:{sha256(body).hexdigest()}"
-DELTA_MESSAGE_PREFIX = "dllm-delta"
+# canonical signed messages
+DELTA_MESSAGE_PREFIX = "dllm-delta"  # "dllm-delta:{worker_id}:{round}:{sha256(body)}"
+DEREGISTER_MESSAGE_PREFIX = "dllm-deregister"  # "dllm-deregister:{worker_id}:{ts_unix}"
 
 
 def default_identity_path() -> Path:
@@ -97,6 +98,38 @@ def verify_delta(
     msg = canonical_delta_message(worker_id, round_no, body)
     try:
         pubkey.verify(sig, msg)
+        return True
+    except InvalidSignature:
+        return False
+
+
+def canonical_deregister_message(worker_id: int, ts_unix: int) -> bytes:
+    """Bytes signed for a voluntary /deregister request.
+
+    Includes a unix timestamp so coord can reject replayed signatures
+    older than a small window — defeats an attacker who sniffs a stale
+    deregister and tries to re-use it later.
+    """
+    return f"{DEREGISTER_MESSAGE_PREFIX}:{worker_id}:{ts_unix}".encode("utf-8")
+
+
+def sign_deregister(sk: Ed25519PrivateKey, worker_id: int, ts_unix: int) -> str:
+    sig = sk.sign(canonical_deregister_message(worker_id, ts_unix))
+    return base64.b64encode(sig).decode("ascii")
+
+
+def verify_deregister(
+    pubkey: Ed25519PublicKey,
+    worker_id: int,
+    ts_unix: int,
+    signature_b64: str,
+) -> bool:
+    try:
+        sig = base64.b64decode(signature_b64)
+    except (ValueError, TypeError):
+        return False
+    try:
+        pubkey.verify(sig, canonical_deregister_message(worker_id, ts_unix))
         return True
     except InvalidSignature:
         return False

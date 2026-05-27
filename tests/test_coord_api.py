@@ -177,6 +177,168 @@ def test_parallel_state_get_assembles_full_body(client: TestClient) -> None:
     assert r.headers.get("x-round") == "0"
 
 
+def test_deregister_removes_active_worker(tmp_path: Path) -> None:
+    """Worker calls POST /deregister with valid signature → coord drops
+    the registration immediately. Quorum recomputes so the surviving
+    cohort can close the current round.
+    """
+    import time as _t
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_deregister
+
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+    )
+    client = TestClient(create_app(coord))
+
+    sk = load_or_create_identity(tmp_path / "id.key")
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+    )
+    assert r.status_code == 200
+    wid = r.json()["worker_id"]
+    assert wid in coord.workers
+
+    ts = int(_t.time())
+    sig = sign_deregister(sk, wid, ts)
+    r = client.post("/deregister", params={"worker_id": wid, "ts": ts, "signature": sig})
+    assert r.status_code == 200
+    assert r.json()["removed"] is True
+    assert wid not in coord.workers
+
+
+def test_deregister_idempotent(tmp_path: Path) -> None:
+    """Deregistering an unknown worker_id returns 200 with removed=False
+    instead of raising — atexit can fire twice, network retries can
+    duplicate, and we want it to be safe to call again.
+    """
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+    )
+    client = TestClient(create_app(coord))
+
+    r = client.post(
+        "/deregister", params={"worker_id": 999, "ts": 1, "signature": ""}
+    )
+    assert r.status_code == 200
+    assert r.json()["removed"] is False
+
+
+def test_deregister_rejects_bad_signature(tmp_path: Path) -> None:
+    """Foreign signer can't kick another worker. Coord rejects when the
+    signature doesn't verify against the registered pubkey.
+    """
+    import time as _t
+    from dllm.shared.identity import (
+        load_or_create_identity, pubkey_hex, sign_deregister,
+    )
+
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+        require_signed_deltas=True,
+    )
+    client = TestClient(create_app(coord))
+
+    # Legit worker A registers.
+    sk_a = load_or_create_identity(tmp_path / "a.key")
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump(),
+    )
+    assert r.status_code == 200
+    wid_a = r.json()["worker_id"]
+
+    # Attacker B forges a deregister of A using B's key.
+    sk_b = load_or_create_identity(tmp_path / "b.key")
+    ts = int(_t.time())
+    bad_sig = sign_deregister(sk_b, wid_a, ts)  # signed with B not A
+
+    r = client.post(
+        "/deregister",
+        params={"worker_id": wid_a, "ts": ts, "signature": bad_sig},
+    )
+    assert r.status_code == 401
+    # Worker A still registered.
+    assert wid_a in coord.workers
+
+
+def test_deregister_rejects_stale_timestamp(tmp_path: Path) -> None:
+    """Replay protection: timestamps must be within ±5 min of server clock."""
+    import time as _t
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_deregister
+
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+        require_signed_deltas=True,
+    )
+    client = TestClient(create_app(coord))
+
+    sk = load_or_create_identity(tmp_path / "id.key")
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+    )
+    # Sign a deregister for 1 hour ago.
+    old_ts = int(_t.time()) - 3600
+    sig = sign_deregister(sk, 0, old_ts)
+    r = client.post(
+        "/deregister", params={"worker_id": 0, "ts": old_ts, "signature": sig}
+    )
+    assert r.status_code == 400
+    assert "drift" in r.json()["detail"]
+
+
+def test_deregister_shrinks_world_size(tmp_path: Path) -> None:
+    """After deregister, world_size auto-shrinks so surviving workers can
+    close the current round at the new quorum without waiting on the
+    just-left peer.
+    """
+    import time as _t
+    from dllm.shared.identity import load_or_create_identity, pubkey_hex, sign_deregister
+
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+    )
+    client = TestClient(create_app(coord))
+
+    # Two workers register; world_size auto-scales to 2 at next outer step,
+    # but it's still 1 right after register (intentional mid-round behaviour).
+    sk_a = load_or_create_identity(tmp_path / "a.key")
+    sk_b = load_or_create_identity(tmp_path / "b.key")
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump(),
+    )
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke").model_dump(),
+    )
+    # Manually force world_size up to 2 (simulating having reached an outer
+    # step that already recomputed).
+    coord._recompute_world_size_locked()
+    assert coord.world_size == 2
+
+    # Worker B leaves.
+    ts = int(_t.time())
+    sig = sign_deregister(sk_b, 1, ts)
+    r = client.post(
+        "/deregister", params={"worker_id": 1, "ts": ts, "signature": sig}
+    )
+    assert r.status_code == 200
+    # Quorum target snaps down so worker A doesn't wait forever.
+    assert coord.world_size == 1
+
+
 def test_parallel_state_get_response_supports_raise_for_status(client: TestClient) -> None:
     """Regression: the synthesized httpx.Response from parallel_state_get
     must allow .raise_for_status() — the worker's call sites use it. Earlier
