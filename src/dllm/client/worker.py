@@ -194,6 +194,123 @@ _RETRY_HTTPX_EXC: tuple[type[BaseException], ...] = (
 )
 
 
+def parallel_state_get(
+    client: httpx.Client,
+    url: str,
+    *,
+    n_chunks: int = 4,
+    log_label: str = "GET /state",
+) -> httpx.Response:
+    """Fetch a /state-like URL via N parallel HTTP Range requests.
+
+    Why: ISPs like Vodafone Kabel DE throttle individual TCP flows
+    aggressively (~8 Mbit/s observed) while allowing the user's full
+    aggregate bandwidth (~600 Mbit/s) across many parallel streams.
+    Workers on those networks were taking >10 minutes to pull a 624 MB
+    state per round — half the wall clock was sync.
+
+    Algorithm:
+      1. HEAD the URL to learn content-length + check Range support
+      2. If server says Accept-Ranges: bytes → split into N chunks
+      3. Fetch each chunk in a thread (each on its own TCP connection)
+      4. Concatenate, synthesize a final Response object with the
+         full content + first chunk's headers (x-round, x-codec).
+      5. If server refuses Range OR HEAD fails → fall back to single
+         GET. Lets older coords and quirky middleboxes still work.
+
+    Returns an httpx.Response-shaped object. Caller uses .content,
+    .headers, .raise_for_status as usual.
+    """
+    # 1. Probe.
+    try:
+        head = client.head(url)
+    except _RETRY_HTTPX_EXC as e:
+        log.warning("[%s] HEAD probe failed (%s); falling back to single GET", log_label, e)
+        return client.get(url)
+    if head.status_code != 200 or head.headers.get("accept-ranges", "").lower() != "bytes":
+        log.info(
+            "[%s] no Range support (status=%d, accept-ranges=%r); single GET",
+            log_label,
+            head.status_code,
+            head.headers.get("accept-ranges"),
+        )
+        return client.get(url)
+    try:
+        total = int(head.headers["content-length"])
+    except (KeyError, ValueError):
+        log.info("[%s] no content-length on HEAD; single GET", log_label)
+        return client.get(url)
+
+    # 2. Plan chunks.
+    n = max(1, n_chunks)
+    if total < 4 * 1024 * 1024:  # <4 MiB: not worth parallelizing
+        return client.get(url)
+    chunk_size = (total + n - 1) // n
+    ranges = []
+    for i in range(n):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, total) - 1
+        if start <= end:
+            ranges.append((i, start, end))
+
+    log.info(
+        "[%s] parallel-Range fetch: %d chunks × %s bytes each, total %s",
+        log_label,
+        len(ranges),
+        f"{chunk_size:,}",
+        f"{total:,}",
+    )
+
+    # 3. Fetch in parallel.
+    import time as _time
+    t0 = _time.time()
+    chunks: list[bytes | None] = [None] * len(ranges)
+    common_headers: dict[str, str] = {}
+
+    def _fetch(idx: int, start: int, end: int) -> tuple[int, bytes, dict]:
+        r = client.get(url, headers={"Range": f"bytes={start}-{end}"})
+        r.raise_for_status()
+        if r.status_code not in (206, 200):
+            raise httpx.HTTPError(f"unexpected status {r.status_code} on Range fetch")
+        return idx, r.content, dict(r.headers)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=n, thread_name_prefix="dllm-state-pull") as pool:
+        futures = [pool.submit(_fetch, i, s, e) for i, s, e in ranges]
+        for fut in as_completed(futures):
+            idx, body, hdrs = fut.result()
+            chunks[idx] = body
+            if not common_headers:
+                common_headers = hdrs  # use any chunk's headers as canonical
+    dt = _time.time() - t0
+    full_body = b"".join(c for c in chunks if c is not None)
+    if len(full_body) != total:
+        raise httpx.HTTPError(
+            f"parallel fetch length mismatch: got {len(full_body)}, expected {total}"
+        )
+    speed_mb_per_s = total / dt / 1_000_000 if dt > 0 else 0
+    log.info(
+        "[%s] %d-stream parallel pull: %.1f MB in %.1fs (%.1f MB/s)",
+        log_label,
+        len(ranges),
+        total / 1_000_000,
+        dt,
+        speed_mb_per_s,
+    )
+
+    # 4. Synthesize a Response-like object so callers don't care about
+    # parallel vs single. httpx.Response constructor accepts content +
+    # headers; we strip Range-specific ones the caller doesn't expect.
+    common_headers.pop("content-range", None)
+    common_headers["content-length"] = str(len(full_body))
+    return httpx.Response(
+        status_code=200,
+        headers=common_headers,
+        content=full_body,
+    )
+
+
 def retry_http(
     fn: Callable[[], httpx.Response],
     *,
@@ -457,7 +574,10 @@ class Worker:
         # returns 409 if we're out of sync; we recover by retrying with
         # the coord-reported current_round.
         url = f"/state?round={self.current_round}" if self.current_round else "/state"
-        r = retry_http(lambda: self.http.get(url), label="GET /state (initial)")
+        r = retry_http(
+            lambda: parallel_state_get(self.http, url, log_label="GET /state (initial)"),
+            label="GET /state (initial)",
+        )
         # 409 = round mismatch; coord tells us its current round, retry once.
         if r.status_code == 409:
             try:
@@ -471,8 +591,11 @@ class Worker:
                     their_round,
                 )
                 self.current_round = their_round
+                retry_url = f"/state?round={their_round}"
                 r = retry_http(
-                    lambda: self.http.get(f"/state?round={their_round}"),
+                    lambda: parallel_state_get(
+                        self.http, retry_url, log_label="GET /state (retry 409)"
+                    ),
                     label="GET /state (retry after 409)",
                 )
         r.raise_for_status()
@@ -725,9 +848,13 @@ class Worker:
             if next_r is not None and next_r > round_no:
                 # Per-round URL = Cloudflare-cacheable. The coord just told
                 # us its current round via `next_round`; we ask for that
-                # specific one, immutable forever once written.
+                # specific one, immutable forever once written. Parallel
+                # range fetch defeats per-flow ISP throttling.
+                resync_url = f"/state?round={next_r}"
                 r2 = retry_http(
-                    lambda: self.http.get(f"/state?round={next_r}"),
+                    lambda: parallel_state_get(
+                        self.http, resync_url, log_label="GET /state (resync)"
+                    ),
                     label="GET /state (resync)",
                 )
                 r2.raise_for_status()
@@ -769,8 +896,12 @@ class Worker:
 
         # By here `target` is the new round we want state for. Per-round URL
         # so Cloudflare caches each round's state distinctly + forever.
+        # Parallel-range fetch defeats single-flow ISP throttles.
+        post_url = f"/state?round={target}"
         r2 = retry_http(
-            lambda: self.http.get(f"/state?round={target}"),
+            lambda: parallel_state_get(
+                self.http, post_url, log_label="GET /state (post-accept)"
+            ),
             label="GET /state (post-accept)",
         )
         r2.raise_for_status()

@@ -119,6 +119,64 @@ def test_state_endpoint_returns_409_when_round_mismatch(client: TestClient) -> N
     assert body["requested_round"] == 999
 
 
+def test_state_endpoint_advertises_range_support(client: TestClient) -> None:
+    """All /state responses include Accept-Ranges so clients can probe via
+    HEAD before parallel-fetching."""
+    r = client.get("/state")
+    assert r.status_code == 200
+    assert r.headers.get("Accept-Ranges") == "bytes"
+
+
+def test_state_endpoint_serves_byte_range(client: TestClient) -> None:
+    """Worker asks for bytes 0-1023 → coord returns 206 with exactly those
+    bytes + Content-Range header. Equivalent to a parallel-fetch chunk."""
+    # First grab the full body so we know what bytes 0-1023 should be.
+    full = client.get("/state").content
+    assert len(full) > 1024
+
+    r = client.get("/state", headers={"Range": "bytes=0-1023"})
+    assert r.status_code == 206
+    assert r.headers.get("Content-Range") == f"bytes 0-1023/{len(full)}"
+    assert r.content == full[:1024]
+    assert r.headers.get("Accept-Ranges") == "bytes"
+
+
+def test_state_endpoint_serves_open_ended_range(client: TestClient) -> None:
+    """`Range: bytes=N-` means "from N to end of resource"."""
+    full = client.get("/state").content
+    n = len(full) - 100
+    r = client.get("/state", headers={"Range": f"bytes={n}-"})
+    assert r.status_code == 206
+    assert r.content == full[n:]
+    assert r.headers.get("Content-Range") == f"bytes {n}-{len(full) - 1}/{len(full)}"
+
+
+def test_state_endpoint_416_on_out_of_range(client: TestClient) -> None:
+    """Range past end of body → 416 Range Not Satisfiable + Content-Range
+    hinting the actual length. Standard HTTP semantics."""
+    r = client.get("/state", headers={"Range": "bytes=999999999-999999999"})
+    assert r.status_code == 416
+    cr = r.headers.get("Content-Range")
+    assert cr is not None and cr.startswith("bytes */")
+
+
+def test_parallel_state_get_assembles_full_body(client: TestClient) -> None:
+    """Integration: parallel_state_get(httpx.Client) fetches 4 chunks via
+    Range and reconstructs the full state correctly, matching a normal GET."""
+    from dllm.client.worker import parallel_state_get
+
+    # client.get without Range returns the canonical body.
+    expected = client.get("/state").content
+
+    # TestClient implements .head + .get; parallel_state_get takes any
+    # client with those methods, so we can pass it directly.
+    r = parallel_state_get(client, "/state", n_chunks=4, log_label="test")
+    assert r.status_code == 200
+    assert r.content == expected
+    # Reassembled response should carry the upstream metadata.
+    assert r.headers.get("x-round") == "0"
+
+
 def test_delta_rejects_unknown_worker(client: TestClient) -> None:
     r = client.post("/delta", params={"worker_id": 999, "round": 0}, content=b"")
     assert r.status_code == 404

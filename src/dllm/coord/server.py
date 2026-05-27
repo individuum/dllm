@@ -964,7 +964,7 @@ def create_app(state: CoordinatorState) -> FastAPI:
         return state.status()
 
     @app.get("/state")
-    def get_state(round: int | None = None):
+    def get_state(request: Request, round: int | None = None):
         # Cache-friendly state endpoint (task #61). When a worker passes
         # `?round=N`, Cloudflare/CDN treats each round's state as a distinct
         # URL — `/state?round=89` and `/state?round=90` get separate cache
@@ -972,7 +972,12 @@ def create_app(state: CoordinatorState) -> FastAPI:
         # behaviour falls back to legacy "serve whatever the coord has now"
         # (uncacheable on the CDN side).
         blob, round_no = state.state_blob()
-        headers = {"x-round": str(round_no), "x-codec": state.state_codec}
+        headers = {
+            "x-round": str(round_no),
+            "x-codec": state.state_codec,
+            # Always advertise Range support so clients can probe with HEAD.
+            "Accept-Ranges": "bytes",
+        }
         if round is not None:
             if round != round_no:
                 # Worker asked for state @ round N but coord moved on (or
@@ -993,6 +998,41 @@ def create_app(state: CoordinatorState) -> FastAPI:
             # Legacy `/state` with no round param. Don't cache — content
             # depends on coord's current round which moves over time.
             headers["Cache-Control"] = "no-store"
+
+        # Range support (task #62). Lets workers parallel-fetch chunks over
+        # separate TCP connections — defeats per-TCP-flow QoS throttling
+        # common on Vodafone Kabel DE and similar ISPs. Clients on
+        # well-behaved networks can still single-stream; this is opt-in.
+        range_hdr = request.headers.get("range", "").strip()
+        total = len(blob)
+        if range_hdr.startswith("bytes="):
+            spec = range_hdr[len("bytes=") :].strip()
+            try:
+                start_s, end_s = spec.split("-", 1)
+                start = int(start_s) if start_s else 0
+                end = int(end_s) if end_s else total - 1
+            except (ValueError, AttributeError):
+                return JSONResponse(
+                    status_code=416,
+                    content={"detail": f"malformed Range header: {range_hdr!r}"},
+                )
+            if start < 0 or end >= total or start > end:
+                return JSONResponse(
+                    status_code=416,
+                    content={
+                        "detail": f"range {start}-{end} outside body 0-{total - 1}"
+                    },
+                    headers={"Content-Range": f"bytes */{total}"},
+                )
+            partial = blob[start : end + 1]
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            return Response(
+                content=partial,
+                status_code=206,
+                media_type="application/octet-stream",
+                headers=headers,
+            )
+
         return Response(
             content=blob,
             media_type="application/octet-stream",
