@@ -26,13 +26,15 @@ from __future__ import annotations
 
 import datetime
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -118,7 +120,17 @@ class MainWindow(QMainWindow):
         self._worker_id: int | None = None
         self._last_sync_at: datetime.datetime | None = None
         self._best_val: float | None = None
+        # Energy + cost (session-scoped). Tracked across inner_completed
+        # ticks: each round we know roughly how long the GPU was busy
+        # (wall clock between two inner_completed signals) and roughly its
+        # power draw (most recent power_sample). Energy = ∫(power dt);
+        # cost = energy_kwh * eur_per_kwh — negative rates supported for
+        # PV / dynamic-tariff users whose marginal compute earns money.
+        self._session_wh: float = 0.0
+        self._last_inner_ts: float | None = None
+        self._last_power_w: float | None = None
         self._build_ui()
+        self._load_settings()
 
         # Heartbeat: refresh "last sync N ago" once a second so the UI
         # doesn't look frozen between training rounds.
@@ -155,16 +167,29 @@ class MainWindow(QMainWindow):
         root.addWidget(sub)
 
         # ---- metric tiles -----------------------------------------------
+        # Two rows of 3 tiles. Top row = the training signal (round / val /
+        # throughput). Bottom row = the cost of contributing (power / energy /
+        # money). Helps the volunteer see *what they're paying* alongside
+        # *what they're contributing* — important for the "informed consent"
+        # angle on home-PC compute donation.
         grid = QGridLayout()
         grid.setSpacing(10)
         self.tile_round, self.tile_round_val, self.tile_round_sub = _tile(central, "round")
         self.tile_val, self.tile_val_val, self.tile_val_sub = _tile(central, "val loss")
         self.tile_tps, self.tile_tps_val, self.tile_tps_sub = _tile(central, "throughput")
         self.tile_pow, self.tile_pow_val, self.tile_pow_sub = _tile(central, "power")
+        self.tile_energy, self.tile_energy_val, self.tile_energy_sub = _tile(
+            central, "energy (session)"
+        )
+        self.tile_cost, self.tile_cost_val, self.tile_cost_sub = _tile(
+            central, "cost (session)"
+        )
         grid.addWidget(self.tile_round, 0, 0)
         grid.addWidget(self.tile_val, 0, 1)
         grid.addWidget(self.tile_tps, 0, 2)
-        grid.addWidget(self.tile_pow, 0, 3)
+        grid.addWidget(self.tile_pow, 1, 0)
+        grid.addWidget(self.tile_energy, 1, 1)
+        grid.addWidget(self.tile_cost, 1, 2)
         root.addLayout(grid)
 
         # contributor-meta strip
@@ -192,6 +217,27 @@ class MainWindow(QMainWindow):
         self.preset.addItems(["300M", "smoke"])
         self.preset.setCurrentText(_DEFAULT_PRESET)
         settings.addWidget(self.preset)
+
+        # Electricity price input. Range -1..1 €/kWh because real users on
+        # German PV + dynamic tariffs (Tibber / aWATTar / Octopus) hit
+        # negative spot prices when wind+solar peak in the afternoon. A
+        # volunteer running compute on PV surplus that would otherwise feed
+        # in at ~€0.08/kWh has effectively a NEGATIVE marginal cost.
+        # 4 decimals so users can model exact tariffs (e.g. €0.0832/kWh).
+        settings.addWidget(QLabel("€/kWh"))
+        self.price_per_kwh = QDoubleSpinBox()
+        self.price_per_kwh.setRange(-1.0, 1.0)
+        self.price_per_kwh.setDecimals(4)
+        self.price_per_kwh.setSingleStep(0.01)
+        self.price_per_kwh.setValue(0.30)  # EU rough industrial average
+        self.price_per_kwh.setMinimumWidth(110)
+        self.price_per_kwh.setToolTip(
+            "Negative values supported. PV/dynamic-tariff users on sunny days "
+            "have a negative marginal cost — running compute on otherwise-"
+            "exported PV surplus earns money relative to the feed-in tariff."
+        )
+        self.price_per_kwh.valueChanged.connect(self._on_price_changed)
+        settings.addWidget(self.price_per_kwh)
 
         settings.addStretch(1)
 
@@ -241,6 +287,9 @@ class MainWindow(QMainWindow):
         self._worker_id = None
         self._last_sync_at = None
         self._best_val = None
+        self._session_wh = 0.0
+        self._last_inner_ts = None
+        self._last_power_w = None
         self.tile_round_val.setText("…")
         self.tile_round_sub.setText("connecting…")
         self.tile_val_val.setText("—")
@@ -249,6 +298,9 @@ class MainWindow(QMainWindow):
         self.tile_tps_sub.setText("—")
         self.tile_pow_val.setText("—")
         self.tile_pow_sub.setText("—")
+        self.tile_energy_val.setText("0 Wh")
+        self.tile_energy_sub.setText("session")
+        self._refresh_cost_tile()
         self.meta_label.setText("Starting worker…")
         self.log.clear()
 
@@ -320,6 +372,18 @@ class MainWindow(QMainWindow):
         self.tile_round_sub.setText(f"{steps} inner steps")
         self.tile_tps_val.setText(self._fmt_tok_per_s(tok_per_s))
         self.tile_tps_sub.setText("tok/s · inner loop")
+        # Energy accumulator: between two inner_completed ticks the GPU was
+        # busy for ~delta_t seconds at ~last_power_w watts. Slight
+        # overestimate (includes sync overhead) but stays honest to the
+        # volunteer about wall-clock electricity use, not just compute-only.
+        now = time.time()
+        if self._last_inner_ts is not None and self._last_power_w is not None:
+            dt_hours = (now - self._last_inner_ts) / 3600.0
+            self._session_wh += self._last_power_w * dt_hours
+            self.tile_energy_val.setText(self._fmt_wh(self._session_wh))
+            self.tile_energy_sub.setText(f"{self._rounds_contributed + 1} round(s)")
+            self._refresh_cost_tile()
+        self._last_inner_ts = now
 
     def _on_val_reported(self, round_no: int, loss: float) -> None:
         self.tile_val_val.setText(f"{loss:.3f}")
@@ -347,6 +411,39 @@ class MainWindow(QMainWindow):
     def _on_power_sample(self, watts: float) -> None:
         self.tile_pow_val.setText(f"{watts:.0f} W")
         self.tile_pow_sub.setText("last inner loop")
+        # Remember for the energy accumulator (used next inner_completed).
+        self._last_power_w = watts
+
+    def _on_price_changed(self, _new_value: float) -> None:
+        self._save_settings()
+        self._refresh_cost_tile()
+
+    def _refresh_cost_tile(self) -> None:
+        """Recompute the cost tile from current session_wh × current price.
+
+        Sign convention:
+          price ≥ 0  → it costs the volunteer money. Tile shows "€X.YZ".
+          price < 0  → volunteer earns money (e.g. PV surplus / negative spot
+                       price). Tile shows "+€X.YZ" + "earned".
+        """
+        kwh = self._session_wh / 1000.0
+        eur = kwh * self.price_per_kwh.value()
+        if abs(eur) < 0.005:
+            self.tile_cost_val.setText("—")
+            self.tile_cost_sub.setText(
+                f"@ €{self.price_per_kwh.value():.4f}/kWh"
+            )
+            return
+        if eur < 0:
+            self.tile_cost_val.setText(f"+€{abs(eur):.2f}")
+            self.tile_cost_sub.setText(
+                f"earned · @ €{self.price_per_kwh.value():.4f}/kWh"
+            )
+        else:
+            self.tile_cost_val.setText(f"€{eur:.2f}")
+            self.tile_cost_sub.setText(
+                f"spent · @ €{self.price_per_kwh.value():.4f}/kWh"
+            )
 
     # ------------------------------------------------------------------
     def _on_log_line(self, line: str) -> None:
@@ -375,6 +472,47 @@ class MainWindow(QMainWindow):
         if v >= 1_000:
             return f"{v / 1000:.1f}k"
         return f"{v:.0f}"
+
+    @staticmethod
+    def _fmt_wh(wh: float) -> str:
+        if wh >= 1_000_000:
+            return f"{wh / 1_000_000:.2f} MWh"
+        if wh >= 1_000:
+            return f"{wh / 1000:.2f} kWh"
+        if wh >= 1:
+            return f"{wh:.1f} Wh"
+        if wh > 0:
+            return f"{wh * 1000:.0f} mWh"
+        return "0 Wh"
+
+    # -- QSettings persistence -----------------------------------------
+    def _load_settings(self) -> None:
+        s = QSettings()
+        country = s.value("country", "DE", type=str)
+        if country in _EU_COUNTRIES:
+            self.country.setCurrentText(country)
+        preset = s.value("preset", _DEFAULT_PRESET, type=str)
+        idx = self.preset.findText(preset)
+        if idx >= 0:
+            self.preset.setCurrentIndex(idx)
+        # value() returns a string under some Qt builds — coerce.
+        try:
+            price = float(s.value("price_per_kwh", 0.30))
+        except (TypeError, ValueError):
+            price = 0.30
+        self.price_per_kwh.setValue(max(-1.0, min(1.0, price)))
+        # Save on subsequent changes too.
+        self.country.currentTextChanged.connect(lambda _: self._save_settings())
+        self.preset.currentTextChanged.connect(lambda _: self._save_settings())
+        # price_per_kwh already wired in _build_ui to _on_price_changed,
+        # which calls _save_settings itself.
+        self._refresh_cost_tile()
+
+    def _save_settings(self) -> None:
+        s = QSettings()
+        s.setValue("country", self.country.currentText())
+        s.setValue("preset", self.preset.currentText())
+        s.setValue("price_per_kwh", self.price_per_kwh.value())
 
     @staticmethod
     def _fmt_seconds(s: float) -> str:

@@ -352,6 +352,38 @@ transitions. Acceptable for v1.
   below 5-worker quorum even if 4 leave — round just waits for them
   (or another worker to register) up to `--round-timeout-seconds`.
 
+## Active-worker cap on the coord (2026-05-27)
+
+`--max-active-workers N` (default 0 = uncapped). When `len(workers)` hits
+N, `/register` returns HTTP 429 with `detail: "cohort full: N/N..."`.
+
+Why it matters: bandwidth is NOT the binding constraint on our VPS. Memory
+is. Each in-flight fp32 delta for the 300M model is ~1.25 GB in
+`self.deltas`; the outer step transiently doubles that during averaging.
+With the bf16-coord + in-place-average optimizations, peak RSS is roughly
+`4.45 + 1.25 · N` GB. Kernel OOM-killer fires near 7 GB on the 8 GB
+Netcup VPS → practical safe cap = **4**.
+
+For larger models the cap scales down: 1B model → ~2 workers, 7B → 1.
+For the 124M model that we used during early phases, cap could safely
+sit at ~12. The Dockerfile sets `--max-active-workers 4` for the live
+300M run.
+
+Worker behavior on 429: logs `[CAP] cohort full ...` and exits with
+code 2 (clean stop, not a crash). Desktop GUI parses `[CAP]` for a
+friendly retry-later banner. Auto-eviction (`worker_inactive_timeout_seconds`)
+eventually frees stuck slots so new workers can register.
+
+Coverage: 4 tests in `test_coord_api.py`
+(`test_register_rejects_at_cap_with_429`,
+`test_register_succeeds_after_eviction_frees_slot`,
+`test_status_exposes_max_active_workers`,
+`test_uncapped_default_allows_unlimited_registrations`).
+
+Dashboard surface: "active workers" tile shows `N / max`. Amber tint at
+≥90% full so dashboard visitors can tell a download won't currently be
+admitted. Subtitle adds "cohort full (429 on new /register)" when at cap.
+
 ## Contributor desktop client (2026-05-27)
 
 PySide6 GUI wrapping `dllm.client.worker` so non-CLI volunteers can

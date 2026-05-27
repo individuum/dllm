@@ -107,6 +107,35 @@
 <body>
   <h1>dllm coordinator <span class="live" id="liveDot">live</span></h1>
 
+  <div class="card" style="margin:0 0 1rem;padding:1rem 1.25rem;
+    background:rgba(96,165,250,0.06);border:1px solid var(--accent);
+    display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+    <div style="flex:1 1 320px;min-width:0">
+      <div style="font-size:1.05rem;font-weight:600">
+        Contribute your GPU to the EU sovereign LLM
+      </div>
+      <div style="color:var(--muted);font-size:0.92rem;margin-top:0.25rem">
+        Help train this model with idle hardware. Inference free for contributors and EU residents at release.
+        Outbound HTTPS only — no router config, no firewall changes.
+      </div>
+    </div>
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+      <a href="https://github.com/individuum/dllm/releases/latest"
+         target="_blank" rel="noopener"
+         style="background:var(--accent);color:white;padding:0.6rem 1rem;
+                border-radius:6px;text-decoration:none;font-weight:600;
+                white-space:nowrap">
+        Download client →
+      </a>
+      <a href="https://github.com/individuum/dllm#contributing"
+         target="_blank" rel="noopener"
+         style="border:1px solid var(--border);color:var(--fg);padding:0.6rem 1rem;
+                border-radius:6px;text-decoration:none;white-space:nowrap">
+        How it works
+      </a>
+    </div>
+  </div>
+
   <div id="flopsAlarmBanner" style="display:none;margin:0 0 1rem;padding:0.75rem 1rem;
     background:rgba(217,119,6,0.10);border:1px solid var(--warn);border-radius:6px;
     color:var(--warn);font-size:0.95rem">
@@ -884,14 +913,29 @@ async function refresh() {
       banner.style.display = "none";
     }
 
-    document.getElementById("workers").textContent = status.n_registered;
+    // "active workers" tile. When max_active_workers > 0 (operator
+    // enforced a cap), show "N / max" so a visitor can tell at a glance
+    // whether they could join. >=90% full triggers an amber tint so
+    // contributors arriving via the dashboard download CTA see the
+    // upcoming "cohort full" rejection before they bother installing.
+    const cap = status.max_active_workers || 0;
+    const workersEl = document.getElementById("workers");
+    workersEl.textContent = cap > 0
+      ? `${status.n_registered} / ${cap}`
+      : `${status.n_registered}`;
+    workersEl.style.color = cap > 0 && status.n_registered >= cap * 0.9
+      ? "var(--warn)"
+      : "";
     const ws_target = status.n_submitted + status.waiting_for;
     const phase = status.n_submitted >= ws_target
       ? "delta in, advancing"
       : status.n_submitted > 0
         ? `${status.n_submitted}/${ws_target} delta(s) in, waiting for ${status.waiting_for}`
         : `computing inner loop · ${ws_target} delta(s) needed`;
-    document.getElementById("workers_sub").textContent = phase;
+    const capNote = cap > 0 && status.n_registered >= cap
+      ? " · cohort full (429 on new /register)"
+      : "";
+    document.getElementById("workers_sub").textContent = phase + capNote;
     document.getElementById("open").textContent =
       `${fmtSeconds(status.round_open_seconds)} / timeout ${fmtSeconds(status.round_timeout_seconds)}`;
     document.getElementById("quorum").textContent =

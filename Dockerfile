@@ -34,5 +34,11 @@ CMD [ \
     "--round-timeout-seconds", "1800", \
     "--min-workers", "1", \
     "--worker-inactive-timeout-seconds", "3600", \
+    "--max-active-workers", "4", \
     "--device", "cpu" \
 ]
+# --max-active-workers 4: hard cap so the 8 GB VPS doesn't OOM. Each
+# active fp32 delta for the 300M model is ~1.25 GB; baseline RSS ~3.6 GB
+# leaves room for ~3 deltas + averaging overhead before the kernel OOM-
+# killer fires near 7 GB. 4 is the lived ceiling. Bump only after the
+# coord moves to a larger VPS or we ship streaming delta averaging.

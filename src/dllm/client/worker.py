@@ -340,6 +340,21 @@ class Worker:
             preset=self.preset,
         )
         r = self.http.post("/register", json=req.model_dump())
+        # HTTP 429 = the coord's cohort cap is full. Surface a clear,
+        # actionable message instead of the generic HTTPStatusError that
+        # raise_for_status would print. Desktop client greps for "[CAP]"
+        # to show a friendly retry-later banner; CLI users see it on stderr.
+        if r.status_code == 429:
+            try:
+                reason = r.json().get("detail", "cohort full")
+            except Exception:  # noqa: BLE001
+                reason = "cohort full"
+            log.error(
+                "[CAP] %s. Try again later — workers are auto-evicted after "
+                "inactivity, freeing slots. Stopping cleanly.",
+                reason,
+            )
+            raise SystemExit(2)
         r.raise_for_status()
         data = r.json()
         self.worker_id = data["worker_id"]

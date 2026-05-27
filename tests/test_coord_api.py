@@ -808,6 +808,141 @@ def test_world_size_shrinks_on_eviction() -> None:
     )
 
 
+def test_register_rejects_at_cap_with_429() -> None:
+    """When max_active_workers > 0 and cohort is full, /register returns
+    HTTP 429 with a clear reason. This is the safety valve that stops the
+    8 GB VPS from OOMing once each fp32 delta starts costing ~1.25 GB.
+    """
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        max_active_workers=2,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    # First two registrations succeed.
+    for i in range(2):
+        r = client.post(
+            "/register",
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+        )
+        assert r.status_code == 200
+    # Third is rejected with 429.
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey="w_overflow", preset="smoke").model_dump(),
+    )
+    assert r.status_code == 429
+    body = r.json()
+    assert "cohort full" in body["detail"].lower()
+    assert "2/2" in body["detail"]
+
+
+def test_register_succeeds_after_eviction_frees_slot() -> None:
+    """At cap, then evict one — next /register goes through."""
+    import time as _t
+
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        max_active_workers=1,
+        worker_inactive_timeout_seconds=60.0,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey="w0", preset="smoke").model_dump(),
+    )
+    assert r.status_code == 200
+
+    # Second worker hits the cap.
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey="w1", preset="smoke").model_dump(),
+    )
+    assert r.status_code == 429
+
+    # Forge a stale last_seen on worker 0; auto-evict frees the slot.
+    coord.workers[0]["last_seen_ts"] = _t.time() - 9999
+    coord._evict_stale_workers()
+    assert 0 not in coord.workers
+
+    # Now the second registration goes through.
+    r = client.post(
+        "/register",
+        json=RegisterRequest(pubkey="w1", preset="smoke").model_dump(),
+    )
+    assert r.status_code == 200
+
+
+def test_status_exposes_max_active_workers() -> None:
+    """Dashboard reads /status to render 'X / N contributors' — make sure
+    the field is exposed.
+    """
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        max_active_workers=8,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    s = client.get("/status").json()
+    assert s["max_active_workers"] == 8
+
+
+def test_uncapped_default_allows_unlimited_registrations() -> None:
+    """max_active_workers=0 = no cap (operator opt-in only). Backward
+    compat: existing deployments not flipped to a positive cap stay open.
+    """
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=2, seed=0
+    )
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        max_active_workers=0,  # explicit
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    for i in range(20):
+        r = client.post(
+            "/register",
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+        )
+        assert r.status_code == 200
+    assert len(coord.workers) == 20
+
+
 def test_delta_ack_carries_shard_assignment() -> None:
     """Choice B: every DeltaAck includes the current (shard_index,
     shard_world_size). On the very first /delta this matches the worker's

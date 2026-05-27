@@ -78,6 +78,7 @@ class CoordinatorState:
         max_inner_steps: int = 2000,
         retune_threshold: float = 0.20,
         flops_alarm_threshold: float = 5e24,
+        max_active_workers: int = 0,
     ) -> None:
         if preset_name not in PRESETS:
             raise ValueError(f"unknown preset {preset_name!r}; have {list(PRESETS)}")
@@ -131,6 +132,14 @@ class CoordinatorState:
         # alarm at half that so the operator has time to plan a soft landing
         # / CoP Safety chapter prep / AI Office notification window.
         self.flops_alarm_threshold = max(0.0, flops_alarm_threshold)
+        # Hard cap on simultaneous active registrations. The 8 GB Netcup VPS
+        # OOMs around N=4 for the 300M model: each in-flight delta is ~1.25
+        # GB fp32 in self.deltas, and the outer step transiently doubles
+        # that during averaging. With the bf16-coord + in-place-average
+        # optimizations we get peak RSS ≈ 4.45 + 1.25·N GB; OOM-killer fires
+        # near 7 GB on this VPS. 0 disables the cap (no limit; relies on
+        # operator to size sensibly for the host).
+        self.max_active_workers = max(0, max_active_workers)
         # Ring buffer of (round, val_loss, flops_total, ts) appended at each
         # outer step. Powers the dashboard chart at GET /.
         # Persisted to <checkpoint_dir>/history.jsonl (append-only NDJSON)
@@ -498,6 +507,32 @@ class CoordinatorState:
                     status_code=400,
                     detail=f"preset mismatch: coord={self.preset_name}, worker={req.preset}",
                 )
+            # Capacity check (memory-driven on small VPSes). HTTP 429 is the
+            # right code: "we appreciate the offer but we're full, try again
+            # after a worker leaves". 0 disables. Auto-evict eventually frees
+            # slots if a registered worker goes silent for
+            # `worker_inactive_timeout_seconds`.
+            if (
+                self.max_active_workers > 0
+                and len(self.workers) >= self.max_active_workers
+            ):
+                log.warning(
+                    "[REGISTER] rejected (cap full): %d/%d active workers; "
+                    "country=%s gpu=%s preset=%s",
+                    len(self.workers),
+                    self.max_active_workers,
+                    req.country,
+                    req.gpu,
+                    req.preset,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"cohort full: {len(self.workers)}/{self.max_active_workers} "
+                        "active workers. Try again later when a slot frees up "
+                        "(workers are auto-evicted after inactivity)."
+                    ),
+                )
             # parse pubkey eagerly so bad keys fail at registration, not at /delta
             parsed_pubkey = None
             if req.pubkey:
@@ -561,6 +596,7 @@ class CoordinatorState:
                 waiting_for=max(0, self.world_size - n_sub),
                 world_size=self.world_size,
                 min_world_size=self.min_world_size,
+                max_active_workers=self.max_active_workers,
                 last_val_loss=self.last_val_loss,
                 flops_total=self.flops_total,
                 flops_alarm_threshold=self.flops_alarm_threshold,
@@ -1057,6 +1093,17 @@ def main() -> None:
             "AI Office notification. 0 disables."
         ),
     )
+    ap.add_argument(
+        "--max-active-workers",
+        type=int,
+        default=0,
+        help=(
+            "Hard cap on simultaneous active registrations. /register "
+            "returns HTTP 429 when at cap. Memory-driven on small VPSes — "
+            "for the 300M model on 8 GB RAM, practical safe cap is ~4 "
+            "(each fp32 delta is ~1.25 GB). 0 = uncapped."
+        ),
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -1098,6 +1145,7 @@ def main() -> None:
         max_inner_steps=args.max_inner_steps,
         retune_threshold=args.retune_threshold,
         flops_alarm_threshold=args.flops_alarm_threshold,
+        max_active_workers=args.max_active_workers,
     )
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

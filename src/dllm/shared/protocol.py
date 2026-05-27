@@ -36,6 +36,10 @@ class RoundStatus(BaseModel):
     # when new workers register, and shrinks immediately on auto-evict.
     world_size: int = 1
     min_world_size: int = 1
+    # Hard cap on simultaneous active registrations. 0 = uncapped. When
+    # n_registered hits this, /register returns HTTP 429 until a worker
+    # leaves (manual stop or auto-eviction). Memory-driven on small VPSes.
+    max_active_workers: int = 0
     last_val_loss: float | None = None  # mean val loss across workers from the previous round
     flops_total: float = 0.0  # cumulative training FLOPs estimate
     flops_alarm_threshold: float = 0.0  # 0 = disabled; >0 = warn when flops_total ≥ this

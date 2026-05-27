@@ -23,7 +23,10 @@ import sys
 from pathlib import Path
 
 block_cipher = None
-project_root = Path.cwd()
+# Anchor to the spec file's location rather than cwd. PyInstaller chdirs
+# into the spec's directory while parsing, so cwd != where the user typed
+# `pyinstaller packaging/desktop/dllm_desktop.spec`.
+project_root = Path(SPECPATH).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +57,10 @@ hidden_imports = [
 
 # Data files to bundle alongside the binary. The coord dashboard.html is
 # only needed when running coord-mode locally; harmless on contributor
-# install (~50 KB).
+# install (~50 KB). Use absolute paths anchored at project_root because
+# PyInstaller resolves relative paths from the spec's directory.
 datas = [
-    ("src/dllm/coord/dashboard.html", "dllm/coord"),
+    (str(project_root / "src" / "dllm" / "coord" / "dashboard.html"), "dllm/coord"),
 ]
 
 
