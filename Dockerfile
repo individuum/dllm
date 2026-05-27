@@ -35,6 +35,8 @@ CMD [ \
     "--min-workers", "1", \
     "--worker-inactive-timeout-seconds", "3600", \
     "--max-active-workers", "4", \
+    "--tier-aware", \
+    "--target-round-seconds", "600", \
     "--device", "cpu" \
 ]
 # --max-active-workers 4: hard cap so the 8 GB VPS doesn't OOM. Each
