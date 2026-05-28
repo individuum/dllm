@@ -4,8 +4,8 @@
 
 - **Coordinator**: `https://dllm.planetbass.de` (Phase 1 VPS, see [infra/README.md](infra/README.md))
 - Health: `GET /health` → `{ok, round}`. Status: `GET /status` → `{current_round, n_registered, n_submitted, waiting_for, last_val_loss, flops_total}`.
-- **Running preset**: `124M` (~200 MB bf16 state at `/state`, `x-codec: bf16`, delta codec `q8`).
-- World size + inner steps are returned by `POST /register` — observed `inner_steps=500` with `world_size=2` on 2026-05-25.
+- **Running preset**: `300M` (~624 MB bf16 state at `/state`, `x-codec: bf16`, delta codec `q8`). Coord on `--seq-len 4096`, `--target-round-seconds 420`, tier-aware + straggler grace (180 s) + AIMD pacing; dynamic `world_size`; protocol-version handshake on `/register`.
+- World size + inner steps are returned by `POST /register`; per-worker `inner_steps` is then retuned/paced by the coord (tier-aware + AIMD), surfaced on `/workers`.
 
 ## Local setup (macOS, no system Python ≥3.11)
 
@@ -21,13 +21,32 @@ uv pip install -e ".[data]"   # [data] needed only for dllm.data.prepare
 
 Data prep (`python -m dllm.data.prepare`) downloads 7 EU-language Wikipedia samples and writes `data/cache/{train,val}.bin` + `tokenizer.json` (32k BPE vocab — matches `ModelConfig.vocab_size`). Takes a few minutes. The `.bin` shards are gitignored; identity key persists at `.dllm/identity.key`.
 
-Run the worker:
+Run the worker — **Apple Silicon (M5)** against the live `300M` run:
 ```bash
+git pull && uv pip install -e .      # REQUIRED: must match the coord's
+                                     # protocol_version hash or /register → HTTP 426
 .venv/bin/python -m dllm.client.worker \
     --coord https://dllm.planetbass.de \
-    --preset 124M --country DE --device mps --require-gpu \
-    --max-rounds 200
+    --preset 300M --country DE --device mps --require-gpu \
+    --seq-len 1024 --auto-tune-steps --target-round-seconds 300 \
+    --max-rounds 5000
 ```
+
+Why these flags (all from the "Apple Silicon viable on 300M" work below):
+- `--seq-len 1024` caps the coord's seq_len (4096) **for this worker only**.
+  Per-step cost scales ~linearly and attention ~quadratically with seq_len, so it's
+  the biggest lever for MPS. Deltas are per-parameter, so the cohort can mix seq_len.
+  Without it (and without the real-valued RoPE fix) the M5 is ~15× too slow on 300M.
+- `--auto-tune-steps` benchmarks the GPU and picks an initial `inner_steps`; the
+  coord's tier-aware + AIMD straggler pacing then size it so the M5 keeps pace
+  (it self-throttles down via `[PACE]` backoff and never blocks the fast cohort).
+- `git pull && pip install -e .` is mandatory before launch: the coord enforces a
+  protocol-version handshake (`dllm.shared.version.PROTOCOL_VERSION`), and a client
+  on stale code is turned away with HTTP 426 (`[VERSION]` in the worker log).
+
+A 3060-class CUDA worker omits `--seq-len` (runs the full 4096) and `--micro-batch-size`
+defaults from the coord; e.g. `--device cuda --require-gpu --micro-batch-size 1
+--val-batches 32 --max-rounds 5000`.
 
 ## Fixed: stale-round resync (was: worker exits on stale-round rejection)
 
