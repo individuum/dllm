@@ -72,65 +72,32 @@ Every `/state` and `/delta` call in [worker.py](src/dllm/client/worker.py) was u
 
 **Fix**: module-level `retry_http()` with exponential backoff (1/2/4s, 4 attempts). Retries `RemoteProtocolError`, `ReadError`/`ReadTimeout`, `ConnectError`/`ConnectTimeout`, `WriteError`/`WriteTimeout`, `PoolTimeout`, and HTTP 5xx. **Passes 4xx through** — 404 on `/delta` is now caught at the call site, logged as `coord deregistered worker_id=X. Stopping.`, and the main loop exits cleanly via `dropped: True` instead of raising. Coverage: [tests/test_retry_http.py](tests/test_retry_http.py) (6 cases including the exact truncated-body failure observed live).
 
-## Open: M5 deregistered before first delta
+## RESOLVED: Apple Silicon (MPS) viable on 300M (2026-05-28)
 
-**Observed after the retry fix landed.** M5 worker registered cleanly, downloaded state, ran auto-tuned inner loop, then `POST /delta` got 404 because the coord had already timed it out. Timing breakdown:
+The old "M5 can't contribute" failures (evicted before first delta; ~15× too slow on
+300M) are fixed:
+- **Evicted before first delta** → worker sends a background heartbeat
+  (`GET /status?worker_id` every 120 s from register on); coord bootstrap
+  `--inner-steps` is 50 so a cold first loop fits the timeouts; `_reregister_and_resync`
+  recovers from a 404; a `--viability-factor` gate exits cleanly (`[VERSION]`-style log)
+  if a device is hopelessly slow rather than silently looping.
+- **~15× too slow on 300M** = mostly seq_len (300M trains at seq 4096 vs old 124M's
+  1024) PLUS a real MPS pathology: the **complex64 RoPE** (`torch.polar` /
+  `view_as_complex`) CPU-fell-back on Metal. Fixed with a **real-valued RoPE**
+  (`core/model.py`, cos/sin + mul/add) — numerically identical so existing checkpoints
+  stay valid (`tests/test_rope.py`) and MPS-native — plus a worker **`--seq-len` cap**
+  (train seq 1024 while the coord runs 4096; deltas are per-parameter so the cohort can
+  mix seq_len). The seq cap is the biggest single lever. See the M5 launch above.
 
-| stage | wall clock |
-|---|---|
-| initial `GET /state` (192 MiB over WAN) | ~70 s |
-| auto-tune benchmark (5 warmup + 30 measured steps) | ~15 s |
-| first real inner loop (MPS JIT cold) | ~120 s |
-| val + sign + `POST /delta` | ~30 s |
-| **time-to-first-heartbeat** | **~4 min** |
+## RESOLVED: per-worker val_loss skew in heterogeneous cohorts (2026-05-26/28)
 
-The coord's dereg timeout is shorter than that, so a sole M5 worker can't ever contribute to round 1.
-
-**Second-order finding: auto-tune is misleading on MPS.** The benchmark measures **4,710 tok/s** after 5 warmup steps; observed first-inner-loop throughput on the same model was **392 tok/s** (~12× slower). The second inner loop in the same process runs at ~3,500 tok/s — close to the benchmark. So MPS pays a large JIT-warmup tax that only 5 benchmark steps don't pay. Either the benchmark needs >50 warmup steps on MPS, or the cadence calculation should discard the first inner loop's wall clock.
-
-**Two complementary fixes**:
-1. *Worker-side*: on `POST /delta` 404, automatically re-register and resume (~20 LOC in `run()` + `_apply_sync_result`). Turns the graceful "Stopping" into a transparent recovery.
-2. *Coord-side*: longer worker-inactivity timeout, or treat an in-flight `GET /state` as a heartbeat. Right value is probably max(2× pull_state time, 3× target_round_seconds).
-
-Either fix alone unblocks M5; both together make the system robust to similar imbalances at other tiers.
-
-## Observed: per-worker val_loss skew across heterogeneous cohort (2026-05-26)
-
-After flipping `--world-size=2` and getting both 3060 + M5 contributing, dashboard val
-jumped 4.55 → 5.49. Not a regression of the consensus model — an averaging artifact:
-
-| round | 3060 val | M5 val | mean reported |
-|---|---|---|---|
-| 135 | 4.67 | 6.68 | **5.67** |
-| 136 | 4.59 | 6.39 | **5.49** |
-| 137 | 4.51 | (pending) | — |
-
-M5 joined at round 135 and is doing its first long inner loops on a stale local model
-(it pulled state once at join and hasn't resynced since). Its per-worker val reflects
-*its own local θ*, not the consensus θ that the outer step produces. The outer step
-averages **gradients** not losses, so the post-step cohort model's true val is close to
-the 3060's number (~4.5), not the reported mean (5.49).
-
-`last_val_loss` on `/status` is `mean(worker val_losses)` and is therefore misleading
-in a heterogeneous cohort where workers' local θ diverge. The new dashboard's "active
-workers" table surfaces per-worker val_loss so this is visible at a glance.
-
-**Root cause was actually deeper:** `ShardLoader` partitioned `val.bin` by
-`worker_id % world_size`. With world_size=2 the M5 was validating on the *second
-half* of val.bin — a different EU language slice than the 3060 was using. Per-token
-entropy varies meaningfully across the de/fr/es/it/en/nl/pl languages, so worker
-val_losses live on different distributions and aren't comparable. Fixed by hard-coding
-`val_loader = ShardLoader(val.bin, worker_id=0, world_size=1)` in the worker — every
-worker now validates against the full val.bin. Test: `test_worker_val_loader_spans_full_file_regardless_of_world_size`.
-
-After the val-shard fix lands, both workers' val should land within noise (~±0.1) of
-each other and the averaged `last_val_loss` becomes a meaningful cohort signal again.
-
-Future improvements:
-1. Coord runs val on the consensus model itself after each outer step — slow on CPU
-   container but truthful. ~10× simpler than weighting schemes.
-2. Weight `last_val_loss` by how recently each worker resynced its `last_ref` (still
-   matters for the per-round drift artifact even with shared val).
+`last_val_loss` was `mean(worker val_losses)`, misleading when a slow/fresh/shorter-seq
+worker reads structurally higher (3.9 consensus + 6.8 fresh M5 → 5.3 "loss=5!" false
+alarm). Fixes: (1) every worker validates on the **full val.bin** (`ShardLoader(...,
+worker_id=0, world_size=1)`) so numbers are comparable; (2) headline `last_val_loss` is
+now the **consensus-tracker = min across the round** (the full-seq worker tracking
+consensus has the lowest); cohort mean kept as `mean_val_loss`, surfaced on the dashboard
+only when it diverges. Per-worker values stay on `/workers`.
 
 ## Corpus v2 — 5B tokens, 5 languages, EU-compliant (2026-05-26)
 
@@ -241,8 +208,11 @@ register time.
 **Coord side** ([server.py](src/dllm/coord/server.py) `_maybe_retune_worker`):
 1. Workers report `tokens_per_sec` on every /delta (already did, dashboard
    used it for cohort throughput).
-2. Coord computes `proposed = clamp(round(tps * target / (batch * seq)),
-   [min_inner_steps, max_inner_steps])` per worker.
+2. Coord computes `proposed = clamp(round(tps * target / tokens_per_step *
+   pace_factor), [_straggler_floor, max_inner_steps])` per worker.
+   `tokens_per_step` is the worker's OWN `micro_batch × seq_len` (reported on
+   /delta — #67); using the coord's `--micro-batch-size` instead silently
+   halved everyone's inner_steps. `pace_factor` is the AIMD term (see below).
 3. Only fires when `|proposed - current| / current > retune_threshold`
    (default 20%) — kills dashboard churn from tok/s noise.
 4. Stores per-worker `inner_steps` in `self.workers[wid]`; surfaced on
@@ -265,9 +235,54 @@ applies `result["inner_steps"]` (carried from ack) by overwriting
 **Dashboard**: workers table grew an "inner steps" column; current-round
 table gains a "tier-aware scheduling" row showing target_round_seconds.
 
-Coverage: 5 tests in `test_coord_api.py` (per-worker assignment,
-backward-compat off path, retune threshold, /status exposure, FLOPs
-account correctness under tier-aware).
+Coverage: tier-aware tests in `test_coord_api.py` (per-worker assignment,
+backward-compat off path, retune threshold, /status exposure, FLOPs account,
+and #67 — sizing against worker-reported `tokens_per_step`).
+
+## Straggler grace + AIMD pacing (2026-05-28)
+
+Heterogeneous cohort (fast 3060 + slow M5): a synchronous round used to block on the
+slowest worker, idling the fast one 20-30 min. Now:
+- **Straggler grace** (`--straggler-grace-seconds 180`): once `min_workers` have
+  submitted (quorum), force-advance after the grace even if others haven't — caps
+  fast-worker idle. The straggler's late delta hits the stale→resync path.
+- **AIMD pace** (`--straggler-backoff 0.5`): a worker force-advanced past gets its
+  `inner_steps` AND a persistent `pace_factor` cut ×0.5 (floor `min_inner_steps/8`);
+  the reduced value rides back on the stale ack. Each round it keeps pace, `pace_factor`
+  recovers ×1.25 toward 1.0; tier-aware scales its target by it. So a slow worker
+  converges to the most loops it can finish per round without blocking the cohort; a
+  healthy worker (pace_factor=1.0) is sized exactly as before. Log: `[STRAGGLER]`/`[PACE]`.
+  Coverage in `test_timeout.py`.
+
+## Protocol version handshake (2026-05-28)
+
+`dllm.shared.version.PROTOCOL_VERSION` = short hash of `(DLLM_VERSION, COMPAT_EPOCH)`.
+Worker sends it in `RegisterRequest`; coord checks it FIRST in `register()`, rejects a
+mismatch/missing with **HTTP 426** (worker logs `[VERSION]`, exits 2). Exposed on
+`/status` + `/workers`. **Bump `COMPAT_EPOCH`** on a real wire/codec/arch break (or to
+force the cohort onto a new build) — NOT for numerically-equivalent refactors (e.g. real
+RoPE). Deploying a bumped coord means restarting ALL clients on the matching commit.
+
+## Coord module layout (server.py refactor, 2026-05-28)
+
+`coord/server.py` was split (behavior-preserving, mixin-assembled `CoordinatorState`):
+`server.py` (core: __init__, register/deregister/status/submit_delta, state, `main`;
+re-exports `create_app`) · `rounds.py` `RoundsMixin` (timeout thread, eviction,
+force-advance, `_outer_step_locked`) · `scheduling.py` `SchedulingMixin` (FLOPs, dynamic
+world_size, tier-aware + AIMD) · `routes.py` (`create_app` + FastAPI routes + dashboard) ·
+`history.py` `HistoryMixin` · `persistence.py` (checkpoints).
+`from dllm.coord.server import CoordinatorState, create_app, main` still works.
+
+## SFT pipeline + single-GPU trainer (2026-05-28)
+
+Post-training, separate from pretraining: `dllm/data/sft_prepare.py` + `sft_sources/`
+(OASST2, Glaive EN/DE, Hermes-FC, xLAM, Aya, German-RAG, hand-written) → ChatML with
+assistant-only loss mask → `data/cache/sft/{sft_train,sft_val}{,_mask}.bin` + manifest.
+`loader.py::SFTShardLoader` emits `(x, y)` with non-assistant targets set to -100 (model's
+`F.cross_entropy(ignore_index=-100)` masks them — no model change). `dllm/sft_train.py` =
+single-GPU trainer (loads a coord checkpoint, AdamW + cosine, masked loss, saves
+coord-layout `model.safetensors`); SFT runs centrally, not via the DiLoCo coord.
+Generating the corpus (downloads) is a separate run step.
 
 ## Worker auto-reregister on /delta 404 (2026-05-27)
 
