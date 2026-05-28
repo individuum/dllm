@@ -376,7 +376,36 @@ class CoordinatorState:
                 # the lower quorum instead of waiting on a dead peer until
                 # `round_timeout_seconds` fires.
                 self._recompute_world_size_locked()
+                # CRITICAL: if the shrink made the surviving deltas meet
+                # quorum, fire the outer step NOW. The submit_delta path
+                # already passed (it saw the larger world_size and didn't
+                # trigger), and _check_and_force_advance bails when
+                # submitted >= world_size — so without this, the round
+                # deadlocks: a lone worker's delta sits forever while it
+                # long-polls /status for an advance that never comes.
+                self._maybe_close_round_locked()
             return len(to_evict)
+
+    def _maybe_close_round_locked(self) -> bool:
+        """Fire the outer step if the current round's delta count now meets
+        the world_size quorum. Used after eviction/deregister shrinks
+        world_size to <= the already-submitted count — the normal
+        submit_delta trigger already passed at the larger world_size, so
+        nothing else would ever close the round. Caller holds lock.
+        Returns True if an outer step fired.
+        """
+        submitted = len(self.deltas.get(self.round, {}))
+        if submitted >= 1 and submitted >= self.world_size:
+            log.info(
+                "[QUORUM] cohort shrank to world_size=%d with %d delta(s) in "
+                "round %d — closing round now (would otherwise deadlock).",
+                self.world_size,
+                submitted,
+                self.round,
+            )
+            self._outer_step_locked()
+            return True
+        return False
 
     def _check_and_force_advance(self) -> bool:
         """Idempotent. If round has been open > timeout AND >= min_workers have
@@ -637,10 +666,22 @@ class CoordinatorState:
             # Recompute world_size on the way out so the surviving cohort can
             # close the current round at the new (smaller) quorum.
             self._recompute_world_size_locked()
+            # And if that shrink just satisfied quorum for the surviving
+            # deltas, close the round now (same deadlock-avoidance as the
+            # eviction path).
+            self._maybe_close_round_locked()
             return {"removed": True}
 
-    def status(self) -> RoundStatus:
+    def status(self, heartbeat_worker_id: int | None = None) -> RoundStatus:
         with self.lock:
+            # A worker long-polling /status (waiting for the round to advance)
+            # passes its id so we refresh last_seen_ts — otherwise a worker
+            # that's legitimately blocked waiting for slow peers gets
+            # auto-evicted for "inactivity" even though it's alive and just
+            # finished an inner loop. /delta is the normal heartbeat; this
+            # makes /status one too for the long-poll case.
+            if heartbeat_worker_id is not None and heartbeat_worker_id in self.workers:
+                self.workers[heartbeat_worker_id]["last_seen_ts"] = time.time()
             n_sub = len(self.deltas.get(self.round, {}))
             return RoundStatus(
                 current_round=self.round,
@@ -1018,8 +1059,10 @@ def create_app(state: CoordinatorState) -> FastAPI:
         return state.deregister(worker_id, ts, signature)
 
     @app.get("/status", response_model=RoundStatus)
-    def status() -> RoundStatus:
-        return state.status()
+    def status(worker_id: int | None = None) -> RoundStatus:
+        # `worker_id` is optional: dashboards omit it; long-polling workers
+        # pass it so their /status poll doubles as an inactivity heartbeat.
+        return state.status(heartbeat_worker_id=worker_id)
 
     # api_route w/ GET+HEAD: FastAPI doesn't auto-handle HEAD on @app.get,
     # so plain HEAD returns 405. Workers probe with HEAD before deciding

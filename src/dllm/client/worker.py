@@ -955,10 +955,15 @@ class Worker:
 
         target = ack.get("next_round")
         if target is None:
-            # other workers haven't submitted yet — long-poll status
+            # other workers haven't submitted yet — long-poll status.
+            # Pass worker_id so the coord refreshes our last_seen_ts: a
+            # worker blocked here waiting for slow peers would otherwise
+            # be auto-evicted for "inactivity" (only /delta normally
+            # refreshes the timer, and we're between deltas).
             while True:
                 rs = retry_http(
-                    lambda: self.http.get("/status"), label="GET /status (poll)"
+                    lambda: self.http.get(f"/status?worker_id={self.worker_id}"),
+                    label="GET /status (poll)",
                 )
                 rs.raise_for_status()
                 cur = rs.json()["current_round"]

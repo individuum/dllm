@@ -296,6 +296,106 @@ def test_deregister_rejects_stale_timestamp(tmp_path: Path) -> None:
     assert "drift" in r.json()["detail"]
 
 
+def test_eviction_closes_round_when_quorum_met_after_shrink(tmp_path: Path) -> None:
+    """THE DEADLOCK FIX. A 2-worker round where worker A submits, worker B
+    goes silent. When B is evicted, world_size shrinks 2→1 and A's single
+    delta now meets quorum — the round MUST close. Before the fix it
+    deadlocked: submit_delta already passed (saw world_size=2), and
+    _check_and_force_advance bails when submitted>=world_size, so A's delta
+    sat forever while A long-polled.
+    """
+    import time as _t
+    from dllm.shared.serialize import state_to_bytes
+
+    cfg = TrainConfig(
+        seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=5, seed=0
+    )
+    # Floor = 1 (matches the live --world-size 1 config). A second worker
+    # registering pushes the effective world_size to 2; eviction can then
+    # shrink back to 1 (it couldn't if the floor were 2).
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+        worker_inactive_timeout_seconds=60.0, enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    # Two workers register.
+    for i in range(2):
+        client.post("/register", json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump())
+    coord._recompute_world_size_locked()
+    assert coord.world_size == 2
+
+    # Worker 0 submits a delta. Round does NOT close (needs 2).
+    snap = snapshot(coord.model)
+    with torch.no_grad():
+        for p in coord.model.parameters():
+            p.add_(torch.randn_like(p) * 0.001)
+    delta = compute_delta(snap, coord.model)
+    with torch.no_grad():
+        for n, p in coord.model.named_parameters():
+            p.copy_(snap[n])
+    blob = state_to_bytes(delta)
+    ack = client.post(
+        "/delta", params={"worker_id": 0, "round": 0},
+        content=blob, headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack["accepted"] is True
+    assert ack["next_round"] is None  # waiting for worker 1
+    assert coord.round == 0  # round still open
+
+    # Worker 1 goes silent → gets evicted. The shrink (2→1) should close
+    # round 0 with worker 0's lone delta.
+    coord.workers[1]["last_seen_ts"] = _t.time() - 9999
+    coord._evict_stale_workers()
+    assert 1 not in coord.workers
+    assert coord.world_size == 1
+    assert coord.round == 1, (
+        "round must advance after eviction-shrink met quorum; "
+        f"stuck at {coord.round} = the deadlock bug"
+    )
+
+
+def test_status_heartbeat_refreshes_last_seen(tmp_path: Path) -> None:
+    """A long-polling worker passing ?worker_id=N to /status keeps its
+    last_seen_ts fresh so it isn't evicted for inactivity while blocked
+    waiting for peers."""
+    import time as _t
+
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
+    # Force a stale last_seen.
+    coord.workers[0]["last_seen_ts"] = _t.time() - 9999
+
+    # Plain /status (no worker_id) does NOT refresh.
+    client.get("/status")
+    assert coord.workers[0]["last_seen_ts"] < _t.time() - 9000
+
+    # /status?worker_id=0 DOES refresh.
+    client.get("/status?worker_id=0")
+    assert coord.workers[0]["last_seen_ts"] > _t.time() - 5
+
+
+def test_status_heartbeat_unknown_worker_is_noop(tmp_path: Path) -> None:
+    """Heartbeat for an unregistered worker_id is harmless (no crash, no
+    phantom entry)."""
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke", world_size=1, train_cfg=cfg, device="cpu",
+        state_codec="fp32", delta_codec="fp32", checkpoint_dir=None,
+        enable_timeout_thread=False,
+    )
+    client = TestClient(create_app(coord))
+    r = client.get("/status?worker_id=999")
+    assert r.status_code == 200
+    assert 999 not in coord.workers
+
+
 def test_deregister_shrinks_world_size(tmp_path: Path) -> None:
     """After deregister, world_size auto-shrinks so surviving workers can
     close the current round at the new quorum without waiting on the
