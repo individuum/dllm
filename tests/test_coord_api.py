@@ -1148,6 +1148,76 @@ def test_tier_aware_flops_account_per_worker(tier_state: CoordinatorState) -> No
     assert flops > expected_lo
 
 
+def test_tier_aware_sizes_against_worker_reported_tokens_per_step(
+    tier_state: CoordinatorState,
+) -> None:
+    """#67 regression: the coord must size inner_steps using the WORKER's
+    actual tokens-per-step, NOT its own --micro-batch-size.
+
+    Live bug: the coord ran --micro-batch-size 2 (for its CPU delta averaging)
+    while the GPU workers ran --micro-batch-size 1. proposed = tok/s * target /
+    (seq_len * COORD_batch) halved every worker's inner_steps, so rounds closed
+    in ~half target_round_seconds (the "rounds shorter than target" symptom).
+
+    tier_state: seq_len=32, coord micro_batch=4 -> coord-side toks/step=128.
+    A worker reports tokens_per_step=256. At 400 tok/s, target=300s the
+    worker-correct size is 400*300/256 = 468.75 -> 469; the (wrong) coord-config
+    size would be 400*300/128 = 937.5 -> 938. Asserting 469 proves the worker's
+    reported value drove the sizing.
+    """
+    client = TestClient(create_app(tier_state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(tier_state)
+    ack = client.post(
+        "/delta",
+        params={
+            "worker_id": 0,
+            "round": 0,
+            "tokens_per_sec": 400.0,
+            "tokens_per_step": 256,
+        },
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack["inner_steps"] == 469  # used worker's 256, NOT coord's 128 (->938)
+    # Stored per-worker so the next retune + FLOPs accounting stay consistent.
+    assert tier_state.workers[0].get("tokens_per_step") == 256
+    assert tier_state.workers[0]["inner_steps"] == 469
+
+
+def test_tier_aware_flops_uses_worker_reported_tokens_per_step(
+    tier_state: CoordinatorState,
+) -> None:
+    """FLOPs accounting also honors the worker-reported tokens_per_step so the
+    EU AI Act FLOPs total isn't off by the coord/worker batch ratio (#67).
+
+    Both workers report tokens_per_step=64 (half the coord's 128). Steps:
+    w0 = 400*300/64 = 1875, w1 = 200*300/64 = 937.5 -> 938 (both unclamped).
+    Round FLOPs = 6 * n_params * (1875 + 938) * 64 — keyed on the reported 64,
+    not the coord's 128.
+    """
+    client = TestClient(create_app(tier_state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(tier_state)
+    for wid, tps in ((0, 400.0), (1, 200.0)):
+        client.post(
+            "/delta",
+            params={
+                "worker_id": wid,
+                "round": 0,
+                "tokens_per_sec": tps,
+                "tokens_per_step": 64,
+            },
+            content=blob,
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert tier_state.round == 1
+    flops = client.get("/status").json()["flops_total"]
+    n_params = float(tier_state.model.num_params(non_embedding=False))
+    expected = 6.0 * n_params * (1875 + 938) * 64
+    assert flops == pytest.approx(expected, rel=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # FLOPs alarm threshold (EU AI Act systemic-risk pre-warning)
 # ---------------------------------------------------------------------------

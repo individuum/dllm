@@ -462,20 +462,23 @@ class CoordinatorState:
         Caller holds self.lock.
         """
         n_params = float(self.model.num_params(non_embedding=False))
-        toks_per_step = self.train_cfg.seq_len * self.train_cfg.micro_batch_size
+        # Default per-step token count from the coord's own config; only used
+        # for workers that predate the worker-reported tokens_per_step field.
+        default_toks_per_step = self.train_cfg.seq_len * self.train_cfg.micro_batch_size
         if contributors:
             toks_per_round = 0
             for wid in contributors:
-                steps = int(
-                    self.workers.get(wid, {}).get(
-                        "inner_steps", self.train_cfg.inner_steps
-                    )
-                )
-                toks_per_round += toks_per_step * steps
+                w = self.workers.get(wid, {})
+                steps = int(w.get("inner_steps", self.train_cfg.inner_steps))
+                # Use the worker's ACTUAL tokens/step when reported (#67): the
+                # coord's --micro-batch-size can differ from the worker's, so
+                # using it here mis-counts the AI Act FLOPs total by that ratio.
+                tps_step = int(w.get("tokens_per_step") or default_toks_per_step)
+                toks_per_round += tps_step * steps
         else:
             # Fall back to the legacy world_size × default-steps estimate.
             toks_per_round = (
-                toks_per_step * self.train_cfg.inner_steps * self.world_size
+                default_toks_per_step * self.train_cfg.inner_steps * self.world_size
             )
         return 6.0 * n_params * toks_per_round
 
@@ -742,6 +745,7 @@ class CoordinatorState:
         val_loss: float | None = None,
         power_watts: float | None = None,
         tokens_per_sec: float | None = None,
+        tokens_per_step: int | None = None,
         signature_b64: str | None = None,
     ) -> DeltaAck:
         with self.lock:
@@ -787,6 +791,11 @@ class CoordinatorState:
                 ws["last_power_watts"] = power_watts
             if tokens_per_sec is not None and tokens_per_sec > 0:
                 ws["last_tokens_per_sec"] = tokens_per_sec
+            # Worker's real tokens-per-optimizer-step (micro_batch × seq_len).
+            # Stored per-worker so tier-aware retune AND FLOPs accounting size
+            # against the worker's actual batch, not the coord's config (#67).
+            if tokens_per_step is not None and tokens_per_step > 0:
+                ws["tokens_per_step"] = int(tokens_per_step)
             log.info(
                 "delta round=%d worker=%d (%d/%d)%s%s",
                 self.round,
@@ -837,11 +846,21 @@ class CoordinatorState:
         """
         if not self.tier_aware or tokens_per_sec is None or tokens_per_sec <= 0:
             return None
-        toks_per_step = self.train_cfg.seq_len * self.train_cfg.micro_batch_size
+        ws = self.workers[worker_id]
+        # Size against the WORKER's real tokens-per-step (#67). The coord's
+        # --micro-batch-size is set for its own CPU averaging (e.g. 2) and can
+        # differ from a worker running --micro-batch-size 1 for VRAM; using the
+        # coord's value here silently halved every worker's inner_steps so
+        # rounds finished in ~half target_round_seconds. submit_delta stored
+        # the worker's value just above; fall back to coord config for workers
+        # that don't report it (backward compatible).
+        toks_per_step = int(
+            ws.get("tokens_per_step")
+            or (self.train_cfg.seq_len * self.train_cfg.micro_batch_size)
+        )
         target_tokens = tokens_per_sec * self.target_round_seconds
         proposed = int(round(target_tokens / max(1, toks_per_step)))
         proposed = max(self.min_inner_steps, min(self.max_inner_steps, proposed))
-        ws = self.workers[worker_id]
         current = int(ws.get("inner_steps", self.train_cfg.inner_steps))
         if current <= 0:
             current = self.train_cfg.inner_steps
@@ -1152,6 +1171,7 @@ def create_app(state: CoordinatorState) -> FastAPI:
         val_loss: float | None = None,
         power_watts: float | None = None,
         tokens_per_sec: float | None = None,
+        tokens_per_step: int | None = None,
     ):
         body = await request.body()
         sig = request.headers.get("x-delta-signature")
@@ -1162,6 +1182,7 @@ def create_app(state: CoordinatorState) -> FastAPI:
             val_loss=val_loss,
             power_watts=power_watts,
             tokens_per_sec=tokens_per_sec,
+            tokens_per_step=tokens_per_step,
             signature_b64=sig,
         )
         return JSONResponse(ack.model_dump())

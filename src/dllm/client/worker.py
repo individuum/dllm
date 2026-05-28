@@ -940,6 +940,17 @@ class Worker:
             params["power_watts"] = power_watts
         if tokens_per_sec is not None:
             params["tokens_per_sec"] = tokens_per_sec
+        # Report our ACTUAL tokens-per-optimizer-step so the coord's tier-aware
+        # scheduler sizes inner_steps against our real per-step token count, not
+        # its own --micro-batch-size (coord may run a different batch for its CPU
+        # averaging). This is exactly the product used for the tok/s above, so
+        # the two are self-consistent. Lets the coord hit target_round_seconds
+        # instead of ~half it. (#67)
+        tps_step = int(getattr(self, "micro_batch_size", 0)) * int(
+            getattr(self, "seq_len", 0)
+        )
+        if tps_step > 0:
+            params["tokens_per_step"] = tps_step
         r = retry_http(
             lambda: self.http.post(
                 "/delta",
