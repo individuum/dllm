@@ -23,19 +23,49 @@ class RMSNorm(nn.Module):
 
 
 def precompute_freqs_cis(head_dim: int, seq_len: int, theta: float) -> torch.Tensor:
+    """Precompute the RoPE rotation as REAL cos/sin tables (not complex64).
+
+    Returns shape (2, seq_len, head_dim/2): index 0 = cos, index 1 = sin.
+
+    Why real, not torch.polar/complex64: Apple Silicon (Metal/MPS) has poor
+    complex64 support — the old view_as_complex + complex-multiply path either
+    fell back to CPU (a GPU↔CPU round-trip per layer, ×n_layers, per step) or
+    hit a slow kernel, making MPS ~3× slower than its FLOPs warrant on the
+    300M/seq=4096 config. This real-valued form uses only mul/add and runs
+    natively on MPS, CUDA and CPU. It is numerically identical to the old
+    complex path (same interleaved (x0,x1),(x2,x3)… pairing), so existing
+    checkpoints stay valid — locked down by test_rope_real_matches_complex.
+    """
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     t = torch.arange(seq_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)  # complex64, shape (seq_len, head_dim/2)
+    freqs = torch.outer(t, freqs)  # (seq_len, head_dim/2)
+    return torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=0)
+
+
+def _rope_rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply the interleaved RoPE rotation to one tensor with real cos/sin.
+
+    Reproduces (x_even + i·x_odd)·(cos + i·sin) exactly:
+        out_even = x_even·cos − x_odd·sin
+        out_odd  = x_even·sin + x_odd·cos
+    with the same adjacent-pair (interleaved) layout view_as_complex used.
+    """
+    xf = x.float().reshape(*x.shape[:-1], -1, 2)  # (..., Dh/2, 2)
+    x_even = xf[..., 0]
+    x_odd = xf[..., 1]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    return torch.stack([out_even, out_odd], dim=-1).flatten(-2)
 
 
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
-    # xq, xk: (B, T, H, Dh) — operate in fp32 for numerical stability then cast back
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[: xq_.shape[1]].view(1, xq_.shape[1], 1, xq_.shape[-1])
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    # xq, xk: (B, T, H, Dh). freqs_cis: (2, S, Dh/2) real cos/sin (see above).
+    # Operate in fp32 for numerical stability then cast back.
+    T = xq.shape[1]
+    cos = freqs_cis[0, :T].view(1, T, 1, -1)  # (1, T, 1, Dh/2)
+    sin = freqs_cis[1, :T].view(1, T, 1, -1)
+    xq_out = _rope_rotate(xq, cos, sin)
+    xk_out = _rope_rotate(xk, cos, sin)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 

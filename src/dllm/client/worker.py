@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -171,6 +172,18 @@ def compute_inner_steps_for_target(
     target_tokens = tok_per_s * target_seconds
     steps = int(target_tokens / max(1, batch * seq))
     return max(min_steps, min(max_steps, steps))
+
+
+def estimate_inner_loop_seconds(
+    tok_per_s: float, inner_steps: int, batch: int, seq: int
+) -> float:
+    """Wall-clock seconds for one inner loop of `inner_steps` at `tok_per_s`.
+
+    Used by the viability gate: if this exceeds a multiple of the target round,
+    the device is too slow for the preset and should exit rather than register
+    and get round-timeout-evicted every round.
+    """
+    return inner_steps * batch * seq / max(1.0, tok_per_s)
 
 
 def _sync_device(device: torch.device) -> None:
@@ -518,12 +531,14 @@ class Worker:
         val_batches: int = 8,
         auto_tune_steps: bool = False,
         target_round_seconds: float = 90.0,
+        viability_factor: float = 4.0,
         estimated_watts: float | None = None,
         micro_batch_size_override: int | None = None,
         inner_lr: float = 3e-4,
         inner_lr_min: float = 3e-5,
         lr_warmup_rounds: int = 20,
         lr_decay_rounds: int = 1000,
+        seq_len_override: int | None = None,
     ) -> None:
         self.coord_url = coord_url.rstrip("/")
         self.preset = preset
@@ -531,6 +546,13 @@ class Worker:
         # coord's micro_batch_size downward. Used by register() to clamp
         # the value coming back from /register. None = use coord's value.
         self.micro_batch_size_override = micro_batch_size_override
+        # Compute-constrained devices (Apple Silicon especially) can cap the
+        # coord's training seq_len downward. Per-step cost scales ~linearly and
+        # attention ~quadratically with seq_len, so this is the biggest lever
+        # for a slow device. Deltas are per-parameter, so a worker training at
+        # a shorter seq_len still produces valid deltas for the same θ — the
+        # cohort can mix seq_len. None = use the coord's value.
+        self.seq_len_override = seq_len_override
         # Inner-LR cosine schedule (warmup → peak → cosine → floor), keyed
         # on the global coord round so the whole cohort stays in lockstep.
         # Grounds out the late-training oscillation that constant lr=3e-4
@@ -550,6 +572,15 @@ class Worker:
         self.val_batches = val_batches
         self.auto_tune_steps = auto_tune_steps
         self.target_round_seconds = target_round_seconds
+        # Viability gate: if --auto-tune benchmarking shows one inner loop would
+        # take longer than viability_factor × target_round_seconds, this device
+        # is too slow for the preset — exit cleanly rather than grind and get
+        # round-timeout-evicted. 0 disables. See run().
+        self.viability_factor = viability_factor
+        # Background heartbeat (keeps the coord from evicting us during the
+        # state pull / benchmark / slow first inner loop — see _start_heartbeat).
+        self._hb_stop: threading.Event | None = None
+        self._hb_thread: threading.Thread | None = None
         self.power_meter = PowerMeter(device, override_watts=estimated_watts)
 
         # Ed25519 identity. Default: <repo_root>/.dllm/identity.key (legacy,
@@ -646,7 +677,20 @@ class Worker:
         self.world_size = data["world_size"]
         self.current_round = data["current_round"]
         self.inner_steps = data["inner_steps"]
-        self.seq_len = data["seq_len"]
+        coord_seq_len = int(data["seq_len"])
+        if self.seq_len_override is not None and self.seq_len_override < coord_seq_len:
+            self.seq_len = int(self.seq_len_override)
+            log.warning(
+                "[SEQLEN-OVERRIDE] coord said seq_len=%d; this worker uses %d "
+                "(compute-constrained). Per-step cost drops ~%.1fx; deltas stay "
+                "valid for the same parameters. tokens_per_step reported to the "
+                "coord reflects the smaller value so tier-aware sizes correctly.",
+                coord_seq_len,
+                self.seq_len,
+                coord_seq_len / max(1, self.seq_len),
+            )
+        else:
+            self.seq_len = coord_seq_len
         coord_batch = int(data["micro_batch_size"])
         if self.micro_batch_size_override is not None and self.micro_batch_size_override < coord_batch:
             self.micro_batch_size = int(self.micro_batch_size_override)
@@ -1186,6 +1230,40 @@ class Worker:
             old_wid,
         )
 
+    # -- background heartbeat ------------------------------------------------
+
+    def _start_heartbeat(self, interval: float = 120.0) -> None:
+        """Ping GET /status?worker_id=N every `interval`s in a daemon thread so
+        the coord's worker_inactive_timeout doesn't evict us during long
+        stretches with no /delta: the 624 MB state pull, the auto-tune
+        benchmark, and slow first inner loops.
+
+        This is the recurring "deregistered before first delta" failure — fatal
+        on 300M, where a slow device's first inner loop alone can exceed the
+        600 s inactivity window. /status?worker_id refreshes last_seen_ts the
+        same way the sync long-poll does; this just covers the gaps when the
+        worker is busy computing instead of waiting on a sync.
+        """
+        if self.worker_id is None or self._hb_thread is not None:
+            return
+        self._hb_stop = threading.Event()
+
+        def _loop() -> None:
+            assert self._hb_stop is not None
+            while not self._hb_stop.wait(interval):
+                try:
+                    self.http.get("/status", params={"worker_id": self.worker_id}, timeout=30)
+                except Exception:  # noqa: BLE001 - heartbeat is best-effort
+                    pass
+
+        self._hb_thread = threading.Thread(target=_loop, daemon=True, name="dllm-heartbeat")
+        self._hb_thread.start()
+        log.info("[HEARTBEAT] started (every %.0fs) to hold registration during long ops", interval)
+
+    def _stop_heartbeat(self) -> None:
+        if self._hb_stop is not None:
+            self._hb_stop.set()
+
     # -- voluntary deregister ------------------------------------------------
 
     def _safe_deregister(self) -> None:
@@ -1245,6 +1323,10 @@ class Worker:
         # explicitly for the common case so we don't depend on atexit
         # firing during pytest / embedded usage.
         atexit.register(self._safe_deregister)
+        # Hold our registration through the long no-/delta stretches that
+        # follow (624 MB state pull, benchmark, slow first inner loop) so the
+        # coord's worker_inactive_timeout can't evict us before the first delta.
+        self._start_heartbeat()
         self.pull_state()  # captures last_ref
         self._ensure_loader_and_opt()
 
@@ -1259,10 +1341,33 @@ class Worker:
                 self.micro_batch_size,
                 self.seq_len,
             )
+            # Viability gate: estimate one inner loop's wall clock at the steps
+            # we'll actually run. If it exceeds viability_factor × target, this
+            # device is too slow for this preset/seq_len — exit cleanly with a
+            # clear message rather than register and get round-timeout-evicted
+            # every round (the silent-exclusion failure mode for slow Macs).
+            est_loop_s = estimate_inner_loop_seconds(
+                tok_per_s, new_steps, self.micro_batch_size, self.seq_len
+            )
+            ceiling = self.viability_factor * self.target_round_seconds
+            if self.viability_factor > 0 and est_loop_s > ceiling:
+                log.error(
+                    "[VIABILITY] device=%s too slow for preset %s at seq_len=%d: "
+                    "%.0f tok/s -> one %d-step inner loop ~=%.0fs > %.1fx target (%.0fs). "
+                    "Use a smaller --preset (e.g. 124M) or a shorter --seq-len. Exiting.",
+                    self.device.type, self.preset, self.seq_len, tok_per_s,
+                    new_steps, est_loop_s, self.viability_factor, ceiling,
+                )
+                self._stop_heartbeat()
+                self._safe_deregister()
+                sys.exit(2)
             log.warning(
-                "[AUTO-TUNE] target=%.0fs/round -> inner_steps=%d (coord said %d)",
+                "[AUTO-TUNE] %.0f tok/s, target=%.0fs/round -> inner_steps=%d "
+                "(one loop ~=%.0fs; coord said %d)",
+                tok_per_s,
                 self.target_round_seconds,
                 new_steps,
+                est_loop_s,
                 self.inner_steps,
             )
             self.inner_steps = new_steps
@@ -1321,9 +1426,11 @@ class Worker:
                 if self._apply_sync_result(pending.result()):
                     rounds_committed += 1
         finally:
-            # Deregister BEFORE shutting down the executor so the HTTP
-            # call has a working thread pool. Best-effort; coord-side
+            # Stop the heartbeat first so it can't re-touch the coord after we
+            # deregister. Then deregister BEFORE shutting down the executor so
+            # the HTTP call has a working thread pool. Best-effort; coord-side
             # auto-evict is the safety net.
+            self._stop_heartbeat()
             self._safe_deregister()
             self._exec.shutdown(wait=False)
             self.power_meter.close()
@@ -1353,6 +1460,17 @@ def main() -> None:
         help="Target wall-clock per inner loop when --auto-tune-steps is on",
     )
     ap.add_argument(
+        "--viability-factor",
+        type=float,
+        default=4.0,
+        help=(
+            "With --auto-tune-steps: if the benchmark shows one inner loop would "
+            "take longer than this multiple of --target-round-seconds, the device "
+            "is too slow for the preset/seq_len — exit cleanly with a clear message "
+            "instead of registering and getting round-timeout-evicted. 0 disables."
+        ),
+    )
+    ap.add_argument(
         "--require-gpu",
         action="store_true",
         help="Fail fast if no CUDA/MPS available instead of silently falling back to CPU",
@@ -1376,6 +1494,21 @@ def main() -> None:
             "constrained GPUs like Colab T4 may need 1 even if the cohort "
             "default is 2). Override is one-way: can only DECREASE the "
             "value. FLOPs accounting will slightly under-count this worker."
+        ),
+    )
+    ap.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        dest="seq_len_override",
+        help=(
+            "Cap the coord's training seq_len for THIS worker (one-way: can "
+            "only DECREASE). Biggest lever for compute-constrained devices "
+            "(e.g. Apple Silicon): per-step cost scales ~linearly and "
+            "attention ~quadratically with seq_len. Deltas are per-parameter "
+            "so the cohort can mix seq_len; tokens_per_step reported to the "
+            "coord reflects the cap so tier-aware sizing stays correct. "
+            "Example: --seq-len 1024 against a coord running --seq-len 4096."
         ),
     )
     ap.add_argument(
@@ -1434,6 +1567,8 @@ def main() -> None:
         val_batches=args.val_batches,
         auto_tune_steps=args.auto_tune_steps,
         target_round_seconds=args.target_round_seconds,
+        viability_factor=args.viability_factor,
+        seq_len_override=args.seq_len_override,
         estimated_watts=args.estimated_watts,
         micro_batch_size_override=args.micro_batch_size,
         inner_lr=args.inner_lr,
