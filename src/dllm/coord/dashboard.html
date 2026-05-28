@@ -890,10 +890,17 @@ async function refresh() {
     }
     document.getElementById("val").textContent =
       _displayVal != null ? _displayVal.toFixed(4) : "—";
-    document.getElementById("val_sub").textContent =
-      _displayVal != null
-        ? "perplexity " + Math.exp(_displayVal).toFixed(1) + _displaySource
-        : "perplexity —";
+    // Headline val is the consensus-tracking worker (min across workers). When
+    // the cohort mean diverges (a slower / shorter-seq worker reads higher),
+    // show it so the headline isn't mistaken for a regression.
+    let _valSub = _displayVal != null
+      ? "perplexity " + Math.exp(_displayVal).toFixed(1) + _displaySource
+      : "perplexity —";
+    if (status.mean_val_loss != null && status.last_val_loss != null
+        && status.mean_val_loss - status.last_val_loss > 0.05) {
+      _valSub += " · cohort mean " + status.mean_val_loss.toFixed(2);
+    }
+    document.getElementById("val_sub").textContent = _valSub;
 
     document.getElementById("flops").textContent = fmtFlops(status.flops_total);
     document.getElementById("flops_sub").textContent =

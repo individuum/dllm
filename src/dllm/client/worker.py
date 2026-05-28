@@ -35,6 +35,7 @@ from ..shared.identity import (
     sign_deregister,
 )
 from ..shared.protocol import RegisterRequest
+from ..shared.version import PROTOCOL_VERSION
 from ..shared.serialize import (
     compute_delta,
     deserialize_state,
@@ -654,8 +655,24 @@ class Worker:
             vram_gb=vram,
             ram_gb=0,
             preset=self.preset,
+            protocol_version=PROTOCOL_VERSION,
         )
         r = self.http.post("/register", json=req.model_dump())
+        # HTTP 426 = our code is incompatible with the coord (version-hash
+        # mismatch). No point retrying — surface the upgrade instruction and
+        # stop. Desktop GUI can grep "[VERSION]" for a friendly banner.
+        if r.status_code == 426:
+            try:
+                detail = r.json().get("detail", "protocol version mismatch")
+            except Exception:  # noqa: BLE001
+                detail = "protocol version mismatch"
+            log.error(
+                "[VERSION] %s (this client: %s). Run `git pull && pip install -e .` "
+                "and relaunch. Stopping.",
+                detail,
+                PROTOCOL_VERSION,
+            )
+            raise SystemExit(2)
         # HTTP 429 = the coord's cohort cap is full. Surface a clear,
         # actionable message instead of the generic HTTPStatusError that
         # raise_for_status would print. Desktop client greps for "[CAP]"

@@ -10,6 +10,12 @@ class RegisterRequest(BaseModel):
     vram_gb: int = 0
     ram_gb: int = 0
     preset: str = Field("smoke", description="Model size preset; must match coordinator config")
+    # Magic version hash (dllm.shared.version.PROTOCOL_VERSION). Optional in the
+    # schema so an out-of-date client gets a clean 426 "upgrade" from the coord
+    # instead of a 422 on a missing field. None / mismatch → rejected.
+    protocol_version: str | None = Field(
+        None, description="Client protocol-compat hash; must match the coordinator's"
+    )
 
 
 class RegisterResponse(BaseModel):
@@ -40,7 +46,13 @@ class RoundStatus(BaseModel):
     # n_registered hits this, /register returns HTTP 429 until a worker
     # leaves (manual stop or auto-eviction). Memory-driven on small VPSes.
     max_active_workers: int = 0
-    last_val_loss: float | None = None  # mean val loss across workers from the previous round
+    # Headline val = the consensus-tracking worker's loss (min across the
+    # previous round's per-worker reports). The plain mean is misleading when
+    # workers validate at different seq_len or a fresh joiner reports a drifted
+    # local θ — both inflate it. `mean_val_loss` keeps the cohort mean for
+    # reference; per-worker values are on /workers.
+    last_val_loss: float | None = None
+    mean_val_loss: float | None = None
     flops_total: float = 0.0  # cumulative training FLOPs estimate
     flops_alarm_threshold: float = 0.0  # 0 = disabled; >0 = warn when flops_total ≥ this
     round_open_seconds: float = 0.0  # wall-clock the current round has been open
@@ -51,6 +63,9 @@ class RoundStatus(BaseModel):
     # ~`target_round_seconds` regardless of GPU speed. 0/false = uniform.
     target_round_seconds: float = 0.0
     tier_aware: bool = False
+    # The coordinator's protocol-compat hash. Surfaced so the dashboard /
+    # operators can see what version clients must match to register.
+    protocol_version: str = ""
     # Energy / cohort throughput. Both populated as soon as workers start
     # reporting power_watts + tokens_per_sec on /delta.
     energy_wh_total: float = 0.0  # cumulative Wh used by the cohort
@@ -76,6 +91,9 @@ class WorkerInfo(BaseModel):
     # Tier-aware scheduling: per-worker inner_steps assigned by the coord.
     # None until first /delta with a tokens_per_sec report.
     inner_steps: int | None = None
+    # Protocol-compat hash this worker registered with (always == the coord's,
+    # since mismatches are rejected at /register). Exposed for the dashboard.
+    protocol_version: str | None = None
 
 
 class WorkersResponse(BaseModel):

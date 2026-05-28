@@ -22,6 +22,7 @@ from dllm.shared.identity import (
     sign_delta,
 )
 from dllm.shared.protocol import RegisterRequest
+from dllm.shared.version import PROTOCOL_VERSION
 from dllm.shared.serialize import (
     compute_delta,
     snapshot,
@@ -57,7 +58,7 @@ def _submit_one_delta(state: CoordinatorState, tmp_path: Path) -> None:
     sk = load_or_create_identity(tmp_path / "id.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     snap = snapshot(state.model)
     with torch.no_grad():
@@ -161,8 +162,8 @@ def test_late_delta_after_eviction_is_stale_rejected(
     # A registers, submits round 0
     sk_a = load_or_create_identity(tmp_path / "a.key")
     sk_b = load_or_create_identity(tmp_path / "b.key")
-    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump())
-    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
+    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
 
     snap = snapshot(state.model)
     with torch.no_grad():

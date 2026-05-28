@@ -15,6 +15,7 @@ from dllm.shared.identity import (
     sign_delta,
 )
 from dllm.shared.protocol import RegisterRequest
+from dllm.shared.version import PROTOCOL_VERSION
 from dllm.shared.serialize import (
     compute_delta,
     snapshot,
@@ -63,7 +64,7 @@ def test_history_appends_after_each_outer_step(
     sk = load_or_create_identity(tmp_path / "id.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
 
     # do 3 outer rounds
@@ -117,7 +118,7 @@ def test_history_records_power_and_energy(
     sk = load_or_create_identity(tmp_path / "id.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
 
     for r in range(3):
@@ -181,8 +182,8 @@ def test_cohort_power_is_sum_not_mean_with_two_workers(tmp_path: Path) -> None:
     client = TestClient(create_app(state))
     sk_a = load_or_create_identity(tmp_path / "id_a.key")
     sk_b = load_or_create_identity(tmp_path / "id_b.key")
-    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump())
-    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
+    client.post("/register", json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
 
     snap = snapshot(state.model)
     with torch.no_grad():
@@ -243,14 +244,14 @@ def test_stale_workers_get_evicted(tmp_path: Path) -> None:
     # Ghost worker: registered, never submitted, registered_at is old
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk_old), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk_old), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     state.workers[0]["registered_at"] = 0.0  # epoch — definitely older than 60s
 
     # Fresh worker: just registered
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk_new), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk_new), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
 
     # Before eviction: both registered
@@ -284,7 +285,7 @@ def test_eviction_respects_recently_contributed_worker(tmp_path: Path) -> None:
     sk = load_or_create_identity(tmp_path / "id.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
 
     import time as _t
@@ -304,7 +305,8 @@ def test_workers_endpoint_lists_per_worker_stats(state: CoordinatorState, tmp_pa
     client.post(
         "/register",
         json=RegisterRequest(
-            pubkey=pubkey_hex(sk), preset="smoke", country="DE", gpu="RTX 3060", vram_gb=11
+            pubkey=pubkey_hex(sk), preset="smoke", country="DE", gpu="RTX 3060", vram_gb=11,
+            protocol_version=PROTOCOL_VERSION,
         ).model_dump(),
     )
 
@@ -359,7 +361,7 @@ def test_history_omits_power_when_worker_does_not_report(
     sk = load_or_create_identity(tmp_path / "id.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     snap = snapshot(state.model)
     with torch.no_grad():
@@ -414,7 +416,7 @@ def test_history_persists_to_disk_and_reloads(tmp_path: Path) -> None:
     client1 = TestClient(create_app(s1))
     client1.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     snap = snapshot(s1.model)
     with torch.no_grad():

@@ -11,6 +11,7 @@ from dllm.coord.server import CoordinatorState, create_app
 from dllm.core import PRESETS
 from dllm.core.config import TrainConfig
 from dllm.shared.protocol import RegisterRequest
+from dllm.shared.version import PROTOCOL_VERSION
 from dllm.shared.serialize import (
     average_deltas,
     bytes_to_state,
@@ -69,7 +70,7 @@ def test_status_initial(client: TestClient) -> None:
 
 
 def test_register_returns_worker_id_and_config(client: TestClient) -> None:
-    req = RegisterRequest(pubkey="w0", preset="smoke")
+    req = RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION)
     r = client.post("/register", json=req.model_dump())
     assert r.status_code == 200
     body = r.json()
@@ -80,9 +81,50 @@ def test_register_returns_worker_id_and_config(client: TestClient) -> None:
 
 
 def test_register_rejects_preset_mismatch(client: TestClient) -> None:
-    req = RegisterRequest(pubkey="w0", preset="124M")
+    req = RegisterRequest(pubkey="w0", preset="124M", protocol_version=PROTOCOL_VERSION)
     r = client.post("/register", json=req.model_dump())
     assert r.status_code == 400
+
+
+def test_register_rejects_mismatched_protocol_version(client: TestClient) -> None:
+    """A client on incompatible code (wrong magic hash) is turned away with
+    426 Upgrade Required before any other check."""
+    req = RegisterRequest(pubkey="w0", preset="smoke", protocol_version="deadbeefcafe")
+    r = client.post("/register", json=req.model_dump())
+    assert r.status_code == 426
+    assert "version mismatch" in r.json()["detail"]
+    assert PROTOCOL_VERSION in r.json()["detail"]  # tells the client what to match
+
+
+def test_register_rejects_missing_protocol_version(client: TestClient) -> None:
+    """An old client that sends no protocol_version (field absent → None) is
+    rejected the same way — forces an upgrade rather than 422-ing on a missing
+    field or silently accepting stale code."""
+    body = RegisterRequest(pubkey="w0", preset="smoke").model_dump()
+    assert body["protocol_version"] is None
+    r = client.post("/register", json=body)
+    assert r.status_code == 426
+
+
+def test_register_version_mismatch_checked_before_preset(client: TestClient) -> None:
+    """Version is the first gate: a wrong-preset AND wrong-version request gets
+    426 (version), not 400 (preset) — code-compat is the more fundamental fault."""
+    req = RegisterRequest(pubkey="w0", preset="124M", protocol_version="badbadbadbad")
+    r = client.post("/register", json=req.model_dump())
+    assert r.status_code == 426
+
+
+def test_status_and_workers_expose_protocol_version(client: TestClient) -> None:
+    """The coord publishes its expected hash on /status, and each registered
+    worker's matching hash on /workers (dashboard surfaces 'all on version X')."""
+    s = client.get("/status").json()
+    assert s["protocol_version"] == PROTOCOL_VERSION
+    client.post(
+        "/register",
+        json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
+    )
+    w = client.get("/workers").json()["workers"][0]
+    assert w["protocol_version"] == PROTOCOL_VERSION
 
 
 def test_state_endpoint_returns_safetensors(client: TestClient) -> None:
@@ -196,7 +238,7 @@ def test_deregister_removes_active_worker(tmp_path: Path) -> None:
     sk = load_or_create_identity(tmp_path / "id.key")
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 200
     wid = r.json()["worker_id"]
@@ -250,7 +292,7 @@ def test_deregister_rejects_bad_signature(tmp_path: Path) -> None:
     sk_a = load_or_create_identity(tmp_path / "a.key")
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 200
     wid_a = r.json()["worker_id"]
@@ -285,7 +327,7 @@ def test_deregister_rejects_stale_timestamp(tmp_path: Path) -> None:
     sk = load_or_create_identity(tmp_path / "id.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     # Sign a deregister for 1 hour ago.
     old_ts = int(_t.time()) - 3600
@@ -322,7 +364,7 @@ def test_eviction_closes_round_when_quorum_met_after_shrink(tmp_path: Path) -> N
     client = TestClient(create_app(coord))
     # Two workers register.
     for i in range(2):
-        client.post("/register", json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump())
+        client.post("/register", json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
     coord._recompute_world_size_locked()
     assert coord.world_size == 2
 
@@ -369,7 +411,7 @@ def test_status_heartbeat_refreshes_last_seen(tmp_path: Path) -> None:
         enable_timeout_thread=False,
     )
     client = TestClient(create_app(coord))
-    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
     # Force a stale last_seen.
     coord.workers[0]["last_seen_ts"] = _t.time() - 9999
 
@@ -418,11 +460,11 @@ def test_deregister_shrinks_world_size(tmp_path: Path) -> None:
     sk_b = load_or_create_identity(tmp_path / "b.key")
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk_b), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     # Manually force world_size up to 2 (simulating having reached an outer
     # step that already recomputed).
@@ -584,7 +626,7 @@ def test_delta_rejects_unknown_worker(client: TestClient) -> None:
 
 def test_delta_rejects_stale_round(client: TestClient, state: CoordinatorState) -> None:
     # register one worker so the id is valid
-    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
     # submit a fake (empty) blob at the wrong round — should be rejected without parsing
     r = client.post(
         "/delta",
@@ -604,7 +646,7 @@ def test_full_round_advances_state(client: TestClient, state: CoordinatorState) 
     for i in range(2):
         rr = client.post(
             "/register",
-            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         assert rr.status_code == 200
 
@@ -663,7 +705,7 @@ def test_q8_codec_advertised_in_register(q8_state: CoordinatorState) -> None:
     client = TestClient(create_app(q8_state))
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey="w0", preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 200
     body = r.json()
@@ -679,7 +721,7 @@ def test_q8_delta_flow_advances_round(q8_state: CoordinatorState) -> None:
     for i in range(2):
         client.post(
             "/register",
-            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
 
     snap = snapshot(q8_state.model)
@@ -758,7 +800,7 @@ def test_signed_required_register_rejects_bad_pubkey(signed_state: CoordinatorSt
     client = TestClient(create_app(signed_state))
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey="not-hex!!", preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey="not-hex!!", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 400
 
@@ -771,7 +813,7 @@ def test_signed_required_rejects_unsigned_delta(signed_state: CoordinatorState) 
     try:
         client.post(
             "/register",
-            json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         body = _make_dummy_delta(signed_state)
         ack = client.post(
@@ -794,7 +836,7 @@ def test_signed_required_accepts_valid_signature(signed_state: CoordinatorState)
     try:
         client.post(
             "/register",
-            json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         body = _make_dummy_delta(signed_state)
         sig = sign_delta(sk, worker_id=0, round_no=0, body=body)
@@ -848,7 +890,7 @@ def test_worker_resync_on_stale_round_rejection(tmp_path: Path) -> None:
     # register and pull initial state
     rr = client.post(
         "/register",
-        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey=pubkey_hex(sk), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert rr.status_code == 200
     worker_id = rr.json()["worker_id"]
@@ -915,7 +957,7 @@ def test_signed_required_rejects_other_workers_signature(signed_state: Coordinat
         # A registers as worker_id=0
         client.post(
             "/register",
-            json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=pubkey_hex(sk_a), preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         body = _make_dummy_delta(signed_state)
         # B signs claiming to be A — signature won't verify against A's pubkey
@@ -971,7 +1013,7 @@ def _register_two_workers(client: TestClient) -> None:
     for i in range(2):
         rr = client.post(
             "/register",
-            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         assert rr.status_code == 200
 
@@ -1115,6 +1157,27 @@ def test_tier_aware_status_exposes_target(tier_state: CoordinatorState) -> None:
     s = client.get("/status").json()
     assert s["tier_aware"] is True
     assert s["target_round_seconds"] == 300.0
+
+
+def test_status_last_val_loss_is_consensus_min_not_mean(tier_state: CoordinatorState) -> None:
+    """Headline last_val_loss = the consensus-tracking worker (MIN across the
+    round), not the mean — so a high-val fresh joiner / shorter-seq worker
+    can't make the cohort look like it regressed (the 'loss=5!' false alarm).
+    mean_val_loss keeps the cohort average for reference."""
+    client = TestClient(create_app(tier_state))
+    _register_two_workers(client)
+    blob = _build_dummy_blob(tier_state)
+    for wid, vl in ((0, 3.90), (1, 6.80)):  # 3060-like consensus vs drifted M5-like
+        client.post(
+            "/delta",
+            params={"worker_id": wid, "round": 0, "val_loss": vl, "tokens_per_sec": 4000.0},
+            content=blob,
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert tier_state.round == 1  # round closed
+    s = client.get("/status").json()
+    assert s["last_val_loss"] == pytest.approx(3.90)   # consensus = min, not 5.35
+    assert s["mean_val_loss"] == pytest.approx(5.35)   # mean kept, but not the headline
 
 
 def test_tier_aware_flops_account_per_worker(tier_state: CoordinatorState) -> None:
@@ -1298,9 +1361,9 @@ def test_world_size_does_not_change_mid_round_on_register() -> None:
     # Round 0 opens with world_size=1.
     assert coord.world_size == 1
     # First worker registers.
-    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
     # Second worker registers while round 0 is still open. world_size stays 1.
-    client.post("/register", json=RegisterRequest(pubkey="w1", preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w1", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
     assert coord.world_size == 1, (
         "world_size must not auto-bump mid-round; the round would otherwise "
         "stall waiting on a worker that just joined."
@@ -1315,8 +1378,8 @@ def test_world_size_grows_at_round_boundary() -> None:
     coord = _coord_with_floor(min_world_size=1)
     client = TestClient(create_app(coord))
     # Two workers register during round 0.
-    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke").model_dump())
-    client.post("/register", json=RegisterRequest(pubkey="w1", preset="smoke").model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
+    client.post("/register", json=RegisterRequest(pubkey="w1", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump())
     assert coord.world_size == 1  # not yet bumped (still mid-round)
 
     # Worker 0 submits → since world_size=1, the outer step fires immediately.
@@ -1384,13 +1447,13 @@ def test_register_rejects_at_cap_with_429() -> None:
     for i in range(2):
         r = client.post(
             "/register",
-            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         assert r.status_code == 200
     # Third is rejected with 429.
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey="w_overflow", preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey="w_overflow", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 429
     body = r.json()
@@ -1420,14 +1483,14 @@ def test_register_succeeds_after_eviction_frees_slot() -> None:
     client = TestClient(create_app(coord))
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey="w0", preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 200
 
     # Second worker hits the cap.
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey="w1", preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey="w1", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 429
 
@@ -1439,7 +1502,7 @@ def test_register_succeeds_after_eviction_frees_slot() -> None:
     # Now the second registration goes through.
     r = client.post(
         "/register",
-        json=RegisterRequest(pubkey="w1", preset="smoke").model_dump(),
+        json=RegisterRequest(pubkey="w1", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
     )
     assert r.status_code == 200
 
@@ -1489,7 +1552,7 @@ def test_uncapped_default_allows_unlimited_registrations() -> None:
     for i in range(20):
         r = client.post(
             "/register",
-            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
         assert r.status_code == 200
     assert len(coord.workers) == 20
@@ -1508,7 +1571,7 @@ def test_delta_ack_carries_shard_assignment() -> None:
     for i in range(2):
         client.post(
             "/register",
-            json=RegisterRequest(pubkey=f"w{i}", preset="smoke").model_dump(),
+            json=RegisterRequest(pubkey=f"w{i}", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
         )
     blob = _build_dummy_blob(coord)
     ack0 = client.post(

@@ -40,6 +40,7 @@ from ..core import PRESETS, ModelConfig, Transformer
 from ..core.config import TrainConfig
 from ..shared.identity import pubkey_from_hex, verify_delta, verify_deregister
 from ..shared.protocol import DeltaAck, RegisterRequest, RegisterResponse, RoundStatus
+from ..shared.version import PROTOCOL_VERSION
 from ..shared.serialize import (
     DeltaCodec,
     StateCodec,
@@ -176,7 +177,8 @@ class CoordinatorState:
         self.val_losses: dict[int, list[float]] = {0: []}
         self.power_watts_per_round: dict[int, list[float]] = {0: []}
         self.tokens_per_sec_per_round: dict[int, list[float]] = {0: []}
-        self.last_val_loss: float | None = None
+        self.last_val_loss: float | None = None  # consensus-tracker (min across workers)
+        self.mean_val_loss: float | None = None  # cohort mean (secondary; skewed in heterogeneous cohorts)
         self.last_power_watts: float | None = None  # COHORT sum of last round's workers
         self.last_power_watts_per_worker: float | None = None  # mean for reference
         self.last_n_reporting_workers: int = 0
@@ -534,6 +536,25 @@ class CoordinatorState:
 
     def register(self, req: RegisterRequest) -> RegisterResponse:
         with self.lock:
+            # Version handshake FIRST: a client on incompatible code could send
+            # deltas built against different assumptions, so reject before any
+            # other check. 426 Upgrade Required is the right code. Older clients
+            # send no protocol_version (None) and are turned away the same way.
+            if req.protocol_version != PROTOCOL_VERSION:
+                got = req.protocol_version or "none"
+                log.warning(
+                    "[REGISTER] rejected (version mismatch): coord=%s client=%s "
+                    "country=%s gpu=%s",
+                    PROTOCOL_VERSION, got, req.country, req.gpu,
+                )
+                raise HTTPException(
+                    status_code=426,
+                    detail=(
+                        f"protocol version mismatch: coord={PROTOCOL_VERSION} "
+                        f"client={got}. Update the client (git pull && "
+                        "pip install -e .) and relaunch."
+                    ),
+                )
             if req.preset != self.preset_name:
                 raise HTTPException(
                     status_code=400,
@@ -597,6 +618,7 @@ class CoordinatorState:
                 "inner_steps": self.train_cfg.inner_steps,
                 "shard_index": wid,
                 "shard_world_size": self.world_size,
+                "protocol_version": req.protocol_version,
             }
             log.info(
                 "register worker=%d country=%s gpu=%s preset=%s",
@@ -695,6 +717,7 @@ class CoordinatorState:
                 min_world_size=self.min_world_size,
                 max_active_workers=self.max_active_workers,
                 last_val_loss=self.last_val_loss,
+                mean_val_loss=self.mean_val_loss,
                 flops_total=self.flops_total,
                 flops_alarm_threshold=self.flops_alarm_threshold,
                 round_open_seconds=time.time() - self.round_started_at,
@@ -702,6 +725,7 @@ class CoordinatorState:
                 min_workers=self.min_workers,
                 target_round_seconds=self.target_round_seconds if self.tier_aware else 0.0,
                 tier_aware=self.tier_aware,
+                protocol_version=PROTOCOL_VERSION,
                 energy_wh_total=self.energy_wh_total,
                 last_power_watts=self.last_power_watts,
                 last_power_watts_per_worker=self.last_power_watts_per_worker,
@@ -729,6 +753,7 @@ class CoordinatorState:
                     "inner_steps": w.get("inner_steps"),
                     "shard_index": w.get("shard_index"),
                     "shard_world_size": w.get("shard_world_size"),
+                    "protocol_version": w.get("protocol_version"),
                 }
                 for wid, w in sorted(self.workers.items())
             ]
@@ -926,11 +951,20 @@ class CoordinatorState:
         del avg
         self.outer_opt.step()
 
-        # bookkeeping
-        if self.val_losses[self.round]:
-            self.last_val_loss = sum(self.val_losses[self.round]) / len(
-                self.val_losses[self.round]
-            )
+        # bookkeeping. Headline val = the CONSENSUS-tracking worker's loss =
+        # min across the round's per-worker reports. The MEAN is misleading in
+        # a heterogeneous cohort: workers validate at DIFFERENT seq_len (a
+        # shorter context reads structurally higher) and a fresh joiner reports
+        # its drifted local θ — both inflate the mean far above the consensus
+        # model's true val (e.g. 3.9 consensus + 6.8 fresh M5 → 5.3 mean, the
+        # "loss=5!" false alarm). The worker validating at full seq_len and
+        # tracking consensus has the lowest loss, so min is the truthful single
+        # number. Per-worker values stay on /workers; the mean is kept as a
+        # secondary field for transparency.
+        round_vals = self.val_losses[self.round]
+        if round_vals:
+            self.last_val_loss = min(round_vals)
+            self.mean_val_loss = sum(round_vals) / len(round_vals)
         self.flops_total += self._estimate_round_flops(contributors)
 
         # Cohort power + throughput aggregation. Both are SUMS because workers
