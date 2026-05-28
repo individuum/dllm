@@ -53,6 +53,12 @@ from .persistence import find_latest, load_checkpoint, save_checkpoint
 
 log = logging.getLogger("dllm.coord")
 
+# AIMD recovery: each round a worker keeps pace (submits), its pace_factor is
+# nudged back toward 1.0 by this factor — so a worker that straggled once but can
+# now keep up gradually reclaims its full inner_steps instead of being penalized
+# forever. Paired with the multiplicative cut in _penalize_stragglers_locked.
+_PACE_RECOVER = 1.25
+
 
 class CoordinatorState:
     """All mutable global state; guarded by `lock`."""
@@ -71,6 +77,8 @@ class CoordinatorState:
         require_signed_deltas: bool = False,
         round_timeout_seconds: float = 900.0,
         min_workers: int = 1,
+        straggler_grace_seconds: float = 0.0,
+        straggler_backoff: float = 0.5,
         worker_inactive_timeout_seconds: float = 1800.0,
         enable_timeout_thread: bool = True,
         tier_aware: bool = False,
@@ -107,6 +115,22 @@ class CoordinatorState:
         # resync path on the worker side.
         self.round_timeout_seconds = max(0.0, round_timeout_seconds)
         self.min_workers = max(1, min(min_workers, world_size))
+        # Straggler grace: once >= min_workers have submitted (quorum met), wait
+        # at most this long for the remaining (slower) workers before forcing
+        # the outer step — so a fast worker never idles longer than this for a
+        # slow peer. The straggler's late delta hits the worker-side resync
+        # path and it contributes opportunistically when it can keep pace.
+        # 0 = disabled (only the hard round_timeout force-advances).
+        self.straggler_grace_seconds = max(0.0, straggler_grace_seconds)
+        # Wall-clock when the current round first reached the min_workers
+        # quorum; None until then. Reset each round. Drives the grace timer.
+        self.quorum_met_at: float | None = None
+        # Adaptive pace (AIMD): when a worker is force-advanced past (straggled),
+        # multiply its inner_steps by this factor so it does less next round and
+        # can keep pace. Tier-aware re-grows it gradually (capped — see
+        # _PACE_GROW) when it keeps pace, so it converges to the most work it can
+        # finish per round without holding up the fast cohort.
+        self.straggler_backoff = min(1.0, max(0.05, straggler_backoff))
         # Auto-evict registrations inactive longer than this. Same physical
         # GPU coming back from a crash/restart re-registers cleanly with a
         # fresh worker_id; the old ghost is dropped so the dashboard "active
@@ -190,7 +214,9 @@ class CoordinatorState:
 
         self._timeout_stop = threading.Event()
         self._timeout_thread: threading.Thread | None = None
-        if enable_timeout_thread and self.round_timeout_seconds > 0:
+        if enable_timeout_thread and (
+            self.round_timeout_seconds > 0 or self.straggler_grace_seconds > 0
+        ):
             self._timeout_thread = threading.Thread(
                 target=self._timeout_loop,
                 daemon=True,
@@ -410,16 +436,19 @@ class CoordinatorState:
         return False
 
     def _check_and_force_advance(self) -> bool:
-        """Idempotent. If round has been open > timeout AND >= min_workers have
-        submitted, run the outer step with what we have. Returns True on advance.
+        """Idempotent. Force the outer step with whoever submitted when either:
+          (1) straggler grace: quorum (>= min_workers) was met and we've since
+              waited straggler_grace_seconds for the rest, OR
+          (2) hard timeout: the round has been open > round_timeout_seconds.
+        In both cases we require >= effective_min deltas and < world_size (the
+        regular submit path closes a full round). Returns True on advance.
         """
-        if self.round_timeout_seconds <= 0:
+        if self.round_timeout_seconds <= 0 and self.straggler_grace_seconds <= 0:
             return False
         with self.lock:
-            elapsed = time.time() - self.round_started_at
+            now = time.time()
+            elapsed = now - self.round_started_at
             submitted = len(self.deltas.get(self.round, {}))
-            if elapsed < self.round_timeout_seconds:
-                return False
             # min_workers is clamped DYNAMICALLY against current world_size.
             # Without this clamp, a cohort that shrank below the original
             # min_workers floor (e.g. configured for 5, now down to 2) would
@@ -429,17 +458,35 @@ class CoordinatorState:
                 return False  # too few deltas — keep waiting (e.g. all workers offline)
             if submitted >= self.world_size:
                 return False  # the regular path will handle this on the submitting thread
-            log.warning(
-                "[TIMEOUT] forcing outer step at round=%d with %d/%d deltas after %.1fs (timeout=%.1fs, effective_min=%d)",
-                self.round,
-                submitted,
-                self.world_size,
-                elapsed,
-                self.round_timeout_seconds,
-                effective_min,
-            )
-            self._outer_step_locked()
-            return True
+
+            # (1) straggler grace — caps how long the fast quorum waits for slow peers.
+            if (
+                self.straggler_grace_seconds > 0
+                and self.quorum_met_at is not None
+                and (now - self.quorum_met_at) >= self.straggler_grace_seconds
+            ):
+                log.warning(
+                    "[STRAGGLER] forcing outer step at round=%d with %d/%d deltas "
+                    "%.1fs after quorum (grace=%.1fs) — slow peers will resync",
+                    self.round, submitted, self.world_size,
+                    now - self.quorum_met_at, self.straggler_grace_seconds,
+                )
+                self._penalize_stragglers_locked()
+                self._outer_step_locked()
+                return True
+
+            # (2) hard round timeout (legacy backstop).
+            if self.round_timeout_seconds > 0 and elapsed >= self.round_timeout_seconds:
+                log.warning(
+                    "[TIMEOUT] forcing outer step at round=%d with %d/%d deltas after "
+                    "%.1fs (timeout=%.1fs, effective_min=%d)",
+                    self.round, submitted, self.world_size, elapsed,
+                    self.round_timeout_seconds, effective_min,
+                )
+                self._penalize_stragglers_locked()
+                self._outer_step_locked()
+                return True
+            return False
 
     def stop(self) -> None:
         """Signal the timeout thread to exit. Idempotent; thread is daemon anyway."""
@@ -619,6 +666,7 @@ class CoordinatorState:
                 "shard_index": wid,
                 "shard_world_size": self.world_size,
                 "protocol_version": req.protocol_version,
+                "pace_factor": 1.0,  # AIMD pace; <1 after straggling, recovers on keep-pace
             }
             log.info(
                 "register worker=%d country=%s gpu=%s preset=%s",
@@ -777,10 +825,15 @@ class CoordinatorState:
             if worker_id not in self.workers:
                 raise HTTPException(404, f"unknown worker_id {worker_id}")
             if claimed_round != self.round:
+                # Carry the worker's current inner_steps — if it was force-
+                # advanced past (a straggler), _penalize_stragglers_locked just
+                # cut this value; the worker applies it on its resync so its next
+                # loop is shorter and it can keep pace (AIMD).
                 return DeltaAck(
                     accepted=False,
                     reason=f"stale: coord round={self.round}, worker={claimed_round}",
                     next_round=self.round,
+                    inner_steps=self.workers[worker_id].get("inner_steps"),
                 )
             # signature check (binds worker_id + round + sha256(body) to the pubkey
             # registered at /register time, defeating spoof + replay + tamper)
@@ -797,6 +850,12 @@ class CoordinatorState:
                     return DeltaAck(accepted=False, reason="signature verification failed")
             delta = deserialize_delta(blob, codec=self.delta_codec)
             self.deltas[self.round][worker_id] = delta
+            # Start the straggler-grace timer the moment this round first hits
+            # the min_workers quorum — the grace counts from quorum, not round
+            # open, so the fast quorum waits a bounded time for slow peers.
+            effective_min = max(1, min(self.min_workers, self.world_size))
+            if self.quorum_met_at is None and len(self.deltas[self.round]) >= effective_min:
+                self.quorum_met_at = time.time()
             if val_loss is not None:
                 self.val_losses[self.round].append(val_loss)
             if power_watts is not None and power_watts > 0:
@@ -859,6 +918,41 @@ class CoordinatorState:
                 shard_world_size=shard_world_size,
             )
 
+    @property
+    def _straggler_floor(self) -> int:
+        """Lowest inner_steps an adaptive-paced straggler can be cut to. Below
+        min_inner_steps (the normal sync-efficiency floor) on purpose: the whole
+        point is to let a very slow device do *some* useful work per round rather
+        than block the cohort. Derived from min_inner_steps so one knob scales both."""
+        return max(1, self.min_inner_steps // 8)
+
+    def _penalize_stragglers_locked(self) -> None:
+        """AIMD multiplicative-decrease. Halve (×straggler_backoff) the
+        inner_steps of every active worker that did NOT submit the round we're
+        about to force-advance past, so next round it does less and can land
+        inside the grace window. Floored at _straggler_floor. Caller holds lock
+        and calls this immediately BEFORE _outer_step_locked on the force path."""
+        if self.straggler_backoff >= 1.0:
+            return
+        submitted = set(self.deltas.get(self.round, {}).keys())
+        floor = self._straggler_floor
+        for wid, w in self.workers.items():
+            if wid in submitted:
+                continue
+            # Cut the persistent pace_factor (so tier-aware's next retune sizes
+            # this worker down and won't snap it back up) AND cut inner_steps now
+            # (so the value rides back on the stale ack for an immediate effect).
+            w["pace_factor"] = max(0.05, float(w.get("pace_factor", 1.0)) * self.straggler_backoff)
+            cur = int(w.get("inner_steps", self.train_cfg.inner_steps))
+            new = max(floor, int(cur * self.straggler_backoff))
+            if new < cur:
+                w["inner_steps"] = new
+                log.info(
+                    "[PACE] straggler worker=%d inner_steps %d -> %d pace_factor=%.2f "
+                    "(force-advanced past round %d)",
+                    wid, cur, new, w["pace_factor"], self.round,
+                )
+
     def _maybe_retune_worker(
         self, worker_id: int, tokens_per_sec: float | None
     ) -> int | None:
@@ -884,8 +978,15 @@ class CoordinatorState:
             or (self.train_cfg.seq_len * self.train_cfg.micro_batch_size)
         )
         target_tokens = tokens_per_sec * self.target_round_seconds
-        proposed = int(round(target_tokens / max(1, toks_per_step)))
-        proposed = max(self.min_inner_steps, min(self.max_inner_steps, proposed))
+        # Scale the raw tok/s estimate by this worker's pace_factor (AIMD): 1.0
+        # for a worker keeping pace (→ unchanged tier-aware behavior); cut on each
+        # straggle and recovered gradually when it keeps up, so a chronically-slow
+        # worker settles at the largest inner_steps it can finish per round
+        # without holding up the cohort. Floor lets it drop below the normal
+        # min_inner_steps sync-efficiency floor when it genuinely must.
+        pace = float(ws.get("pace_factor", 1.0))
+        ideal = int(round(target_tokens / max(1, toks_per_step) * pace))
+        proposed = max(self._straggler_floor, min(self.max_inner_steps, ideal))
         current = int(ws.get("inner_steps", self.train_cfg.inner_steps))
         if current <= 0:
             current = self.train_cfg.inner_steps
@@ -925,6 +1026,13 @@ class CoordinatorState:
         # tier-aware FLOPs accounting below to sum each contributor's actual
         # inner_steps (which can differ across the cohort under tier-aware).
         contributors = list(self.deltas[self.round].keys())
+        # AIMD recovery: every worker that submitted this round kept pace, so
+        # nudge its pace_factor back toward 1.0 — a worker that straggled once
+        # but can now keep up gradually reclaims its full inner_steps.
+        for wid in contributors:
+            w = self.workers.get(wid)
+            if w is not None:
+                w["pace_factor"] = min(1.0, float(w.get("pace_factor", 1.0)) * _PACE_RECOVER)
         avg = average_deltas(round_deltas)
         # Free the per-worker delta tensors immediately; the averaged copy
         # in `avg` is the only thing the outer step still needs.
@@ -1005,6 +1113,7 @@ class CoordinatorState:
         self.power_watts_per_round.pop(prev_round, None)
         self.tokens_per_sec_per_round.pop(prev_round, None)
         self.round_started_at = time.time()
+        self.quorum_met_at = None  # reset the straggler-grace timer for the new round
         self._invalidate_state_cache()
         # Dynamic world_size: pick up any registrations that arrived during
         # the round just closed (we deliberately didn't bump mid-round to
@@ -1262,6 +1371,29 @@ def main() -> None:
         help="Minimum deltas needed for a timed-out round to advance (clamped to [1, world_size]).",
     )
     ap.add_argument(
+        "--straggler-grace-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Once >= min-workers have submitted, wait at most this long for the "
+            "remaining (slower) workers before force-advancing the round. Caps how "
+            "long a fast worker idles for a straggler; the straggler's late delta "
+            "resyncs and it contributes opportunistically. 0 = disabled (only the "
+            "hard --round-timeout-seconds force-advances)."
+        ),
+    )
+    ap.add_argument(
+        "--straggler-backoff",
+        type=float,
+        default=0.5,
+        help=(
+            "AIMD multiplicative-decrease factor: a worker force-advanced past "
+            "(straggler) has its inner_steps multiplied by this so it does less "
+            "next round and can keep pace. Tier-aware re-grows it gradually when "
+            "it keeps up. 1.0 = disabled (no backoff)."
+        ),
+    )
+    ap.add_argument(
         "--worker-inactive-timeout-seconds",
         type=float,
         default=1800.0,
@@ -1365,6 +1497,8 @@ def main() -> None:
         require_signed_deltas=args.require_signed_deltas,
         round_timeout_seconds=args.round_timeout_seconds,
         min_workers=args.min_workers,
+        straggler_grace_seconds=args.straggler_grace_seconds,
+        straggler_backoff=args.straggler_backoff,
         worker_inactive_timeout_seconds=args.worker_inactive_timeout_seconds,
         tier_aware=args.tier_aware,
         target_round_seconds=args.target_round_seconds,
