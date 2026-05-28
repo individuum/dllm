@@ -99,6 +99,47 @@ now the **consensus-tracker = min across the round** (the full-seq worker tracki
 consensus has the lowest); cohort mean kept as `mean_val_loss`, surfaced on the dashboard
 only when it diverges. Per-worker values stay on `/workers`.
 
+## Val-loss spike on solo-closed rounds — root fix + guard (2026-05-29)
+
+Symptom: the headline `last_val_loss` spiked whenever a round was **solo-closed** by a
+worker reading structurally high — a short-seq_len M5, or a worker that resynced right
+after a coord **restart** before the full-seq 3060 rejoined (e.g. 4.07 → 6.37 → 4.07; or
+round 525's 4.15 → 5.58 → 4.15 when the 3060 straggled and AIMD cut it). The consensus
+model never regressed. (Diagnosed via the journal: `last_val_loss` tracks `power` — 35 W
+= M5-alone close = spike; 90–145 W = full cohort = baseline.)
+
+**Root cause**: workers validated their **own locally-trained θ** (post-inner-loop), not
+the consensus. In lazy-async DiLoCo the local model is a single worker's solo trajectory
+that's never reset to consensus (only `last_ref` tracks it), so each worker reported a
+*different* model's loss; a short-seq / just-resynced worker reads high, and `min()` had
+nothing better to pick when it solo-closed.
+
+**Root fix (worker)**: `Worker.run_val_on_ref()` validates `self.last_ref` (the consensus
+weights) instead of `self.model` — swap consensus in, eval, restore local θ in a `finally`
+(transient ~0.6 GB clone; falls back to local before the first sync). `run()` calls it in
+place of `run_val()`. Now every worker reports the **same shared model's** loss; only the
+seq_len offset remains and `min()` absorbs it. **No wire/protocol change** (val is still a
+float on /delta), so no `COMPAT_EPOCH` bump — but a client must `git pull && pip install`
+to pick it up; a mixed cohort (old local-val + new consensus-val) is harmless meanwhile.
+
+**Belt-and-suspenders (coord)**: `_update_headline_val_locked(round_vals)` (rounds.py).
+When a round has **< 2 reporters** AND `min` jumps more than `--val-spike-hold-factor`
+(default **1.25**, i.e. +25% — round 525's +34.5% slipped past the original 1.4) over the
+last headline, **hold the previous headline** for `last_val_loss` + history. Bounded by
+`--val-spike-max-holds` (default **3**) so a *genuine* sustained regression still surfaces.
+`mean_val_loss` + per-worker `/workers` ALWAYS carry the true numbers. `last_val_loss` now
+also **survives coord restart** (restored from checkpoint meta) so the guard has a baseline
+on the first post-restart round. Disable with factor ≤ 1.0 or max-holds 0. Log: `[VAL]
+holding headline ...`.
+
+Coverage: `test_coord_api.py` — `test_val_headline_*` (incl. `_round525` regression),
+`test_solo_round_spike_held_end_to_end`, `test_run_val_on_ref_validates_consensus_and_restores_local`,
+`test_run_val_on_ref_falls_back_to_local_before_first_sync`.
+
+NB: the duplicate round numbers on the chart after a restart (e.g. two 516/517 points) are
+a *separate* cosmetic artifact — the coord resumes from the last checkpoint and re-runs
+those rounds; not a regression, not addressed here.
+
 ## Corpus v2 — 5B tokens, 5 languages, EU-compliant (2026-05-26)
 
 The original `prepare.py` pulled small Wikipedia samples (7 langs, ~600 M tokens).

@@ -1180,6 +1180,243 @@ def test_status_last_val_loss_is_consensus_min_not_mean(tier_state: CoordinatorS
     assert s["mean_val_loss"] == pytest.approx(5.35)   # mean kept, but not the headline
 
 
+# -- headline-val spike guard (solo-closed round shouldn't read as a regression) --
+
+def _headline_coord(*, hold_factor: float = 1.25, max_holds: int = 3) -> CoordinatorState:
+    """Minimal coord for unit-testing _update_headline_val_locked directly."""
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=5, seed=0)
+    return CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        enable_timeout_thread=False,
+        val_spike_hold_factor=hold_factor,
+        val_spike_max_holds=max_holds,
+    )
+
+
+def test_val_headline_multi_worker_uses_min() -> None:
+    """Normal multi-worker round: headline = consensus-min, mean = average."""
+    c = _headline_coord()
+    c._update_headline_val_locked([6.0, 4.0])
+    assert c.last_val_loss == pytest.approx(4.0)
+    assert c.mean_val_loss == pytest.approx(5.0)
+    assert c._val_hold_count == 0
+
+
+def test_val_headline_solo_spike_is_held() -> None:
+    """A lone worker reading +60% over the last headline → hold the headline,
+    but mean_val_loss still carries the true (high) number."""
+    c = _headline_coord()
+    c.last_val_loss = 4.0
+    c._update_headline_val_locked([6.4])
+    assert c.last_val_loss == pytest.approx(4.0)   # HELD
+    assert c.mean_val_loss == pytest.approx(6.4)   # truth surfaced
+    assert c._val_hold_count == 1
+
+
+def test_val_headline_holds_moderate_solo_spike_round525() -> None:
+    """Regression for round 525: the M5 solo-closed with val 5.58 over a 4.15
+    consensus headline — only +34.5%, which the OLD 1.4 (+40%) default would
+    have let through. The 1.25 (+25%) default must hold it."""
+    c = _headline_coord()  # default hold_factor=1.25
+    c.last_val_loss = 4.15
+    c._update_headline_val_locked([5.58])
+    assert c.last_val_loss == pytest.approx(4.15)  # HELD (would leak at 1.4)
+    assert c.mean_val_loss == pytest.approx(5.58)
+    assert c._val_hold_count == 1
+
+
+def test_val_headline_solo_small_move_updates_normally() -> None:
+    """A solo round within the jitter band (+5% < 40%) updates the headline."""
+    c = _headline_coord()
+    c.last_val_loss = 4.0
+    c._update_headline_val_locked([4.2])
+    assert c.last_val_loss == pytest.approx(4.2)
+    assert c._val_hold_count == 0
+
+
+def test_val_headline_solo_spike_bootstraps_without_baseline() -> None:
+    """No prior headline (fresh coord) → nothing to hold to → accept the value."""
+    c = _headline_coord()
+    assert c.last_val_loss is None
+    c._update_headline_val_locked([6.4])
+    assert c.last_val_loss == pytest.approx(6.4)
+
+
+def test_val_headline_multi_worker_spike_not_held() -> None:
+    """A >40% jump with 2 reporters is a REAL regression, not a solo artifact —
+    it must surface immediately (guard only fires for solo-closed rounds)."""
+    c = _headline_coord()
+    c.last_val_loss = 4.0
+    c._update_headline_val_locked([6.0, 6.4])
+    assert c.last_val_loss == pytest.approx(6.0)
+    assert c._val_hold_count == 0
+
+
+def test_val_headline_bounded_holds_then_accepts() -> None:
+    """Hold is bounded: after val_spike_max_holds consecutive solo spikes the
+    coord accepts the high value so a genuine sustained regression isn't masked."""
+    c = _headline_coord(max_holds=3)
+    c.last_val_loss = 4.0
+    for expected in (1, 2, 3):
+        c._update_headline_val_locked([6.4])
+        assert c.last_val_loss == pytest.approx(4.0)   # still held
+        assert c._val_hold_count == expected
+    c._update_headline_val_locked([6.4])               # cap reached → accept reality
+    assert c.last_val_loss == pytest.approx(6.4)
+    assert c._val_hold_count == 0
+
+
+def test_val_headline_recovery_resets_hold_count() -> None:
+    """A healthy multi-worker round between spikes resets the hold counter, so
+    the next solo spike gets a fresh budget rather than tripping the cap early."""
+    c = _headline_coord()
+    c.last_val_loss = 4.0
+    c._update_headline_val_locked([6.4])          # solo spike → held
+    assert c._val_hold_count == 1
+    c._update_headline_val_locked([3.9, 6.0])     # healthy round → updates + resets
+    assert c.last_val_loss == pytest.approx(3.9)
+    assert c._val_hold_count == 0
+    c._update_headline_val_locked([6.4])          # next spike held against 3.9
+    assert c.last_val_loss == pytest.approx(3.9)
+    assert c._val_hold_count == 1
+
+
+def test_val_headline_guard_disabled_by_factor() -> None:
+    """val_spike_hold_factor <= 1.0 disables the guard entirely."""
+    c = _headline_coord(hold_factor=1.0)
+    c.last_val_loss = 4.0
+    c._update_headline_val_locked([6.4])
+    assert c.last_val_loss == pytest.approx(6.4)
+
+
+def test_val_headline_guard_disabled_by_max_holds_zero() -> None:
+    """val_spike_max_holds == 0 disables the guard entirely."""
+    c = _headline_coord(max_holds=0)
+    c.last_val_loss = 4.0
+    c._update_headline_val_locked([6.4])
+    assert c.last_val_loss == pytest.approx(6.4)
+
+
+def test_solo_round_spike_held_end_to_end(tmp_path: Path) -> None:
+    """Full /delta path: a lone worker (world_size=1) closing a round with a
+    high val_loss must NOT yank the dashboard headline up — it's held — while
+    /status mean_val_loss reflects the real number. Regression guard for the
+    observed 'val jumped to 6.3 when only the M5 closed the round' false alarm."""
+    cfg = TrainConfig(seq_len=32, micro_batch_size=4, inner_steps=3, max_outer_rounds=5, seed=0)
+    coord = CoordinatorState(
+        preset_name="smoke",
+        world_size=1,
+        train_cfg=cfg,
+        device="cpu",
+        state_codec="fp32",
+        delta_codec="fp32",
+        checkpoint_dir=None,
+        enable_timeout_thread=False,
+    )
+    coord.last_val_loss = 4.0  # established baseline from prior multi-worker rounds
+    client = TestClient(create_app(coord))
+    rr = client.post(
+        "/register",
+        json=RegisterRequest(pubkey="w0", preset="smoke", protocol_version=PROTOCOL_VERSION).model_dump(),
+    )
+    assert rr.status_code == 200
+    blob = _build_dummy_blob(coord)
+    ack = client.post(
+        "/delta",
+        params={"worker_id": 0, "round": 0, "val_loss": 6.4, "tokens_per_sec": 800.0},
+        content=blob,
+        headers={"content-type": "application/octet-stream"},
+    ).json()
+    assert ack["accepted"] is True
+    assert coord.round == 1  # solo round closed (world_size=1)
+    s = client.get("/status").json()
+    assert s["last_val_loss"] == pytest.approx(4.0)   # headline HELD
+    assert s["mean_val_loss"] == pytest.approx(6.4)   # truth surfaced
+
+
+def test_run_val_on_ref_validates_consensus_and_restores_local() -> None:
+    """Root fix: run_val_on_ref must (a) compute val on the CONSENSUS weights in
+    self.last_ref — NOT the locally-trained self.model — so every worker reports
+    the same shared model's loss, and (b) leave self.model byte-identical
+    afterward so the next inner loop + delta are unaffected."""
+    from dllm.client.worker import Worker
+    from dllm.core.model import Transformer
+
+    cfg = PRESETS["smoke"]
+    torch.manual_seed(0)
+    w = object.__new__(Worker)
+    w.model = Transformer(cfg)
+    w.device = torch.device("cpu")
+    w.bf16 = False
+    w.val_batches = 2
+
+    # Local θ = drifted (trained-looking); last_ref = a DISTINCT consensus.
+    with torch.no_grad():
+        for p in w.model.parameters():
+            p.add_(torch.randn_like(p) * 0.02)
+    local_snapshot = {n: p.detach().clone() for n, p in w.model.named_parameters()}
+    w.last_ref = {n: torch.randn_like(p) * 0.01 for n, p in w.model.named_parameters()}
+
+    seq = 16
+    xb = torch.randint(0, cfg.vocab_size, (2, seq))
+    yb = torch.randint(0, cfg.vocab_size, (2, seq))
+
+    class _FakeLoader:
+        def next_batch(self):
+            return xb, yb
+
+    w.val_loader = _FakeLoader()
+
+    # Independent reference: val of a fresh model loaded with the consensus.
+    ref_model = Transformer(cfg)
+    with torch.no_grad():
+        for n, p in ref_model.named_parameters():
+            p.copy_(w.last_ref[n])
+    ref_model.eval()
+    with torch.no_grad():
+        _, loss = ref_model(xb, yb)
+    expected = float(loss.item())  # both val batches are identical → mean == single
+
+    got = w.run_val_on_ref()
+    assert got == pytest.approx(expected, rel=1e-4)  # validated CONSENSUS, not local
+    # local weights restored exactly
+    for n, p in w.model.named_parameters():
+        assert torch.equal(p, local_snapshot[n]), f"{n} not restored after consensus val"
+
+
+def test_run_val_on_ref_falls_back_to_local_before_first_sync() -> None:
+    """Before the first sync last_ref is empty → fall back to validating the
+    local model (which IS the consensus at that point), never crash."""
+    from dllm.client.worker import Worker
+    from dllm.core.model import Transformer
+
+    cfg = PRESETS["smoke"]
+    torch.manual_seed(1)
+    w = object.__new__(Worker)
+    w.model = Transformer(cfg)
+    w.device = torch.device("cpu")
+    w.bf16 = False
+    w.val_batches = 1
+    w.last_ref = {}  # no consensus captured yet
+
+    xb = torch.randint(0, cfg.vocab_size, (2, 16))
+    yb = torch.randint(0, cfg.vocab_size, (2, 16))
+
+    class _FakeLoader:
+        def next_batch(self):
+            return xb, yb
+
+    w.val_loader = _FakeLoader()
+    got = w.run_val_on_ref()
+    assert got is not None and got > 0.0
+
+
 def test_tier_aware_flops_account_per_worker(tier_state: CoordinatorState) -> None:
     """FLOPs accounting under tier-aware: cohort FLOPs sums each worker's
     actual inner_steps, not world_size × default. The fast worker's larger

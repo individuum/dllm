@@ -982,6 +982,46 @@ class Worker:
         self.model.train()
         return sum(losses) / len(losses)
 
+    @torch.no_grad()
+    def run_val_on_ref(self) -> float | None:
+        """Validate the CONSENSUS model (self.last_ref) rather than the locally-
+        trained self.model.
+
+        Why: in lazy-async DiLoCo the local model is a single worker's solo
+        trajectory that's never reset to consensus between rounds (only
+        `last_ref` tracks the coord state). Validating it makes every worker
+        report a DIFFERENT model's loss — and a short-seq_len or just-resynced
+        worker reads structurally high, so when one solo-closes a round the
+        coord's consensus-min headline spikes even though the shared model is
+        fine (observed: 4.15 -> 5.58 -> 4.15). Validating `last_ref` instead
+        makes all workers report the SAME shared model's loss (comparable
+        across the cohort; only the seq_len offset remains, which min() absorbs)
+        — fixing the spike at its root.
+
+        Mechanics: temporarily swap the consensus weights into self.model for
+        the eval, then restore the locally-trained weights so the next inner
+        loop and the delta (compute_delta(last_ref, model)) are unaffected. The
+        backup clone is transient (~0.6 GB bf16 for 300M; fine on 12 GB+ GPUs).
+        Falls back to the local model before the first sync (last_ref empty),
+        when local == consensus anyway.
+        """
+        if self.val_loader is None:
+            return None
+        if not self.last_ref:
+            return self.run_val()  # pre-first-sync: local θ IS the consensus
+        backup = {n: p.detach().clone() for n, p in self.model.named_parameters()}
+        try:
+            with torch.no_grad():
+                for n, p in self.model.named_parameters():
+                    ref = self.last_ref.get(n)
+                    if ref is not None:
+                        p.copy_(ref.to(device=p.device, dtype=p.dtype))
+            return self.run_val()
+        finally:
+            with torch.no_grad():
+                for n, p in self.model.named_parameters():
+                    p.copy_(backup[n])
+
     # -- async sync (background thread) --------------------------------------
 
     def _async_sync_io(
@@ -1394,11 +1434,14 @@ class Worker:
 
         try:
             while rounds_committed < max_rounds:
-                # GPU: inner steps then val on the current local θ
+                # GPU: inner steps, then validate the CONSENSUS model (last_ref),
+                # NOT the drifted local θ — so every worker reports the same
+                # shared model's loss and a solo-closing short-seq/just-resynced
+                # worker can't spike the coord's headline. See run_val_on_ref.
                 self.run_inner()
-                val_loss = self.run_val()
+                val_loss = self.run_val_on_ref()
                 if val_loss is not None:
-                    log.info("val round=%d loss=%.4f", self.current_round, val_loss)
+                    log.info("val round=%d loss=%.4f (consensus)", self.current_round, val_loss)
 
                 # finalize previous round's sync (blocks if network slower than compute)
                 if pending is not None:

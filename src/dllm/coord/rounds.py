@@ -228,10 +228,9 @@ class RoundsMixin:
         # tracking consensus has the lowest loss, so min is the truthful single
         # number. Per-worker values stay on /workers; the mean is kept as a
         # secondary field for transparency.
-        round_vals = self.val_losses[self.round]
-        if round_vals:
-            self.last_val_loss = min(round_vals)
-            self.mean_val_loss = sum(round_vals) / len(round_vals)
+        # NOTE: self.round is still the round being closed here (the increment
+        # happens below), so val_losses[self.round] == this round's reports.
+        self._update_headline_val_locked(self.val_losses[self.round])
         self.flops_total += self._estimate_round_flops(contributors)
 
         # Cohort power + throughput aggregation. Both are SUMS because workers
@@ -326,6 +325,55 @@ class RoundsMixin:
                     "energy_wh_total": self.energy_wh_total,
                 },
             )
+
+    def _update_headline_val_locked(self: CoordinatorState, round_vals: list[float]) -> None:
+        """Set the dashboard headline `last_val_loss` (consensus-min) and the
+        secondary `mean_val_loss` from a round's per-worker val reports.
+
+        Headline = min(round_vals): the worker validating at full seq_len and
+        tracking consensus reads lowest, so the min is the truthful single
+        number for the consensus model's quality (the mean is skewed high in a
+        heterogeneous cohort — see _outer_step_locked's note).
+
+        Spike guard: when a round is SOLO-closed (< 2 reporters) AND the min
+        jumps more than `val_spike_hold_factor` over the last headline, hold the
+        previous headline instead — a lone worker reading structurally high (a
+        short-seq_len M5; a fresh worker that resynced right after a coord
+        restart before the full-seq peer rejoined) shouldn't register as a model
+        regression, since the next multi-worker round drops straight back.
+        Bounded by `val_spike_max_holds` consecutive holds so a *genuine*
+        sustained regression is surfaced rather than masked forever. The held
+        value also flows into history (the caller appends self.last_val_loss),
+        so the chart is smoothed too. `mean_val_loss` and the per-worker
+        /workers values are ALWAYS updated to the true numbers.
+
+        Idempotent w.r.t. an empty list (no reports → leave everything as-is).
+        Caller holds self.lock.
+        """
+        if not round_vals:
+            return
+        candidate = min(round_vals)
+        self.mean_val_loss = sum(round_vals) / len(round_vals)
+        prev = self.last_val_loss
+        guard_on = self.val_spike_hold_factor > 1.0 and self.val_spike_max_holds > 0
+        solo_spike = (
+            guard_on
+            and prev is not None
+            and len(round_vals) < 2
+            and candidate > prev * self.val_spike_hold_factor
+        )
+        if solo_spike and self._val_hold_count < self.val_spike_max_holds:
+            self._val_hold_count += 1
+            log.info(
+                "[VAL] holding headline at %.4f (round %d solo-closed, candidate=%.4f "
+                "= +%.0f%%; hold %d/%d) — mean_val_loss=%.4f carries the true value",
+                prev, self.round, candidate, (candidate / prev - 1.0) * 100.0,
+                self._val_hold_count, self.val_spike_max_holds, self.mean_val_loss,
+            )
+            # leave self.last_val_loss unchanged (held)
+        else:
+            self.last_val_loss = candidate
+            self._val_hold_count = 0
 
 
 def _flat_norm(state: dict[str, torch.Tensor]) -> float:

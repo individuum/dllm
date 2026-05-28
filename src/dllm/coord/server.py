@@ -87,6 +87,8 @@ class CoordinatorState(RoundsMixin, SchedulingMixin, HistoryMixin):
         retune_threshold: float = 0.20,
         flops_alarm_threshold: float = 5e24,
         max_active_workers: int = 0,
+        val_spike_hold_factor: float = 1.25,
+        val_spike_max_holds: int = 3,
     ) -> None:
         if preset_name not in PRESETS:
             raise ValueError(f"unknown preset {preset_name!r}; have {list(PRESETS)}")
@@ -164,6 +166,27 @@ class CoordinatorState(RoundsMixin, SchedulingMixin, HistoryMixin):
         # near 7 GB on this VPS. 0 disables the cap (no limit; relies on
         # operator to size sensibly for the host).
         self.max_active_workers = max(0, max_active_workers)
+        # Headline-val spike guard. The dashboard's `last_val_loss` is the
+        # consensus-min across the round's reporters (the full-seq worker
+        # tracking consensus has the lowest loss). But a round SOLO-closed by a
+        # single worker reading structurally high — a short-seq_len M5, or a
+        # fresh worker that resynced right after a coord restart before the
+        # full-seq 3060 rejoined — yanks the headline up even though the
+        # consensus model didn't regress (the next multi-worker round drops
+        # straight back). When a round has < 2 reporters AND the candidate is a
+        # jump of more than this factor over the last headline, HOLD the
+        # previous headline for the dashboard + history. `mean_val_loss` and the
+        # per-worker /workers values always carry the true numbers. Default 1.25
+        # (a +25% jump): comfortably above normal round-to-round jitter (~±10%),
+        # below the observed +34%..+57% short-seq / fresh-join solo bias (round
+        # 525's +34.5% would slip past the old 1.4 default). NOTE: with the
+        # worker-side consensus-val fix (worker validates last_ref, not its
+        # drifted local θ) this guard is now mostly belt-and-suspenders. Set
+        # <= 1.0 (or max-holds 0) to disable. Bounded by val_spike_max_holds so a *genuine*
+        # sustained regression is surfaced after that many consecutive holds
+        # instead of being masked forever.
+        self.val_spike_hold_factor = float(val_spike_hold_factor)
+        self.val_spike_max_holds = max(0, int(val_spike_max_holds))
         # Ring buffer of (round, val_loss, flops_total, ts) appended at each
         # outer step. Powers the dashboard chart at GET /.
         # Persisted to <checkpoint_dir>/history.jsonl (append-only NDJSON)
@@ -202,6 +225,7 @@ class CoordinatorState(RoundsMixin, SchedulingMixin, HistoryMixin):
         self.tokens_per_sec_per_round: dict[int, list[float]] = {0: []}
         self.last_val_loss: float | None = None  # consensus-tracker (min across workers)
         self.mean_val_loss: float | None = None  # cohort mean (secondary; skewed in heterogeneous cohorts)
+        self._val_hold_count = 0  # consecutive solo-spike rounds the headline has been held (see val_spike_*)
         self.last_power_watts: float | None = None  # COHORT sum of last round's workers
         self.last_power_watts_per_worker: float | None = None  # mean for reference
         self.last_n_reporting_workers: int = 0
@@ -231,6 +255,12 @@ class CoordinatorState(RoundsMixin, SchedulingMixin, HistoryMixin):
                     self.round = int(meta.get("round", 0)) + 1
                     self.flops_total = float(meta.get("flops_total", 0.0))
                     self.energy_wh_total = float(meta.get("energy_wh_total", 0.0))
+                    # Carry the headline across restarts (like flops/energy) so
+                    # the dashboard doesn't blank to n/a, AND so the spike guard
+                    # has a baseline on the first post-restart round — the exact
+                    # window where a lone fresh worker tends to solo-close.
+                    _lv = meta.get("last_val_loss")
+                    self.last_val_loss = float(_lv) if _lv is not None else None
                     self.deltas = {self.round: {}}
                     self.val_losses = {self.round: []}
                     self.power_watts_per_round = {self.round: []}
@@ -743,6 +773,29 @@ def main() -> None:
             "(each fp32 delta is ~1.25 GB). 0 = uncapped."
         ),
     )
+    ap.add_argument(
+        "--val-spike-hold-factor",
+        type=float,
+        default=1.25,
+        help=(
+            "Headline-val spike guard: when a round is SOLO-closed (< 2 "
+            "reporters) and its consensus-min val jumps more than this factor "
+            "over the last headline, hold the previous headline for the "
+            "dashboard/history (a short-seq or fresh-join worker solo-closing "
+            "shouldn't read as a model regression). mean_val_loss + per-worker "
+            "values stay truthful. <= 1.0 disables."
+        ),
+    )
+    ap.add_argument(
+        "--val-spike-max-holds",
+        type=int,
+        default=3,
+        help=(
+            "Max consecutive rounds the headline-val spike guard will hold "
+            "before accepting the high value as real, so a genuine sustained "
+            "regression is never masked forever. 0 disables the guard."
+        ),
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -787,6 +840,8 @@ def main() -> None:
         retune_threshold=args.retune_threshold,
         flops_alarm_threshold=args.flops_alarm_threshold,
         max_active_workers=args.max_active_workers,
+        val_spike_hold_factor=args.val_spike_hold_factor,
+        val_spike_max_holds=args.val_spike_max_holds,
     )
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
