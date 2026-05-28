@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import logging
+import math
 import os
 import sys
 import time
@@ -196,6 +197,44 @@ _RETRY_HTTPX_EXC: tuple[type[BaseException], ...] = (
 )
 
 
+def cosine_lr_for_round(
+    round_no: int,
+    *,
+    peak_lr: float,
+    min_lr: float,
+    warmup_rounds: int,
+    decay_rounds: int,
+) -> float:
+    """Warmup + cosine-decay inner-LR schedule, as a pure function of the
+    global coord round number.
+
+    Why round-keyed (not step-keyed): every worker in the cohort sees the
+    same coord round, so they all compute the *same* inner LR — no drift
+    between a fast 3060 and a slow Colab T4. A worker that joins late at
+    round 400 picks up exactly the LR the schedule prescribes for round
+    400, matching everyone else.
+
+    Schedule:
+        round < warmup_rounds         : linear ramp 0 → peak_lr
+        warmup ≤ round ≤ decay_rounds : cosine peak_lr → min_lr
+        round > decay_rounds          : flat min_lr (don't go to 0; DiLoCo
+                                        keeps training past the planned
+                                        horizon if contributors stay on)
+
+    Constant-LR (the previous behaviour) plateaued + got noisy after
+    ~300 rounds: the model reached the basin 3e-4 can find and then
+    oscillated. Cosine grounds out that late-stage noise.
+    """
+    if warmup_rounds > 0 and round_no < warmup_rounds:
+        return peak_lr * (round_no + 1) / warmup_rounds
+    if round_no >= decay_rounds:
+        return min_lr
+    span = max(1, decay_rounds - warmup_rounds)
+    progress = (round_no - warmup_rounds) / span  # 0 → 1 across the decay
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 → 0
+    return min_lr + (peak_lr - min_lr) * cosine
+
+
 def parallel_state_get(
     client: httpx.Client,
     url: str,
@@ -377,6 +416,10 @@ class Worker:
         target_round_seconds: float = 90.0,
         estimated_watts: float | None = None,
         micro_batch_size_override: int | None = None,
+        inner_lr: float = 3e-4,
+        inner_lr_min: float = 3e-5,
+        lr_warmup_rounds: int = 20,
+        lr_decay_rounds: int = 1000,
     ) -> None:
         self.coord_url = coord_url.rstrip("/")
         self.preset = preset
@@ -384,6 +427,14 @@ class Worker:
         # coord's micro_batch_size downward. Used by register() to clamp
         # the value coming back from /register. None = use coord's value.
         self.micro_batch_size_override = micro_batch_size_override
+        # Inner-LR cosine schedule (warmup → peak → cosine → floor), keyed
+        # on the global coord round so the whole cohort stays in lockstep.
+        # Grounds out the late-training oscillation that constant lr=3e-4
+        # produced after ~300 rounds.
+        self.inner_lr = inner_lr
+        self.inner_lr_min = inner_lr_min
+        self.lr_warmup_rounds = lr_warmup_rounds
+        self.lr_decay_rounds = lr_decay_rounds
         self.country = country
         self.device = device
         self.train_data = train_data
@@ -568,7 +619,7 @@ class Worker:
         if self.opt is None:
             self.opt = torch.optim.AdamW(
                 self.model.parameters(),
-                lr=3e-4,
+                lr=self.inner_lr,  # peak; per-round cosine schedule applied in run_inner
                 betas=(0.9, 0.95),
                 weight_decay=0.1,
                 fused=(self.device.type == "cuda"),
@@ -630,6 +681,19 @@ class Worker:
         self.model.train()
         snap = snapshot(self.model)
 
+        # Apply the cosine inner-LR schedule for THIS round. Constant within
+        # a round (the cosine is smooth enough at round granularity); keyed
+        # on the global coord round so the whole cohort uses the same LR.
+        lr = cosine_lr_for_round(
+            self.current_round,
+            peak_lr=self.inner_lr,
+            min_lr=self.inner_lr_min,
+            warmup_rounds=self.lr_warmup_rounds,
+            decay_rounds=self.lr_decay_rounds,
+        )
+        for g in self.opt.param_groups:
+            g["lr"] = lr
+
         autocast_ctx = (
             torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
             if self.bf16
@@ -667,6 +731,7 @@ class Worker:
         self.last_inner_power_watts = avg_power
 
         power_msg = f" power={avg_power:.0f}W" if avg_power is not None else ""
+        power_msg += f" lr={lr:.2e}"
 
         if self.device.type == "cuda":
             peak_mib = torch.cuda.max_memory_allocated(self.device) / (1024**2)
@@ -1218,6 +1283,32 @@ def main() -> None:
             "value. FLOPs accounting will slightly under-count this worker."
         ),
     )
+    ap.add_argument(
+        "--inner-lr",
+        type=float,
+        default=3e-4,
+        help="Peak inner AdamW learning rate (top of the cosine schedule).",
+    )
+    ap.add_argument(
+        "--inner-lr-min",
+        type=float,
+        default=3e-5,
+        help="Floor inner LR (cosine decays to this, not 0, so training "
+        "continues if contributors stay past the planned horizon).",
+    )
+    ap.add_argument(
+        "--lr-warmup-rounds",
+        type=int,
+        default=20,
+        help="Linear LR warmup over this many coord rounds from the start.",
+    )
+    ap.add_argument(
+        "--lr-decay-rounds",
+        type=int,
+        default=1000,
+        help="Cosine decay horizon in coord rounds (matches the dashboard's "
+        "TARGET_ROUNDS). LR hits the floor at this round, flat thereafter.",
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -1250,6 +1341,10 @@ def main() -> None:
         target_round_seconds=args.target_round_seconds,
         estimated_watts=args.estimated_watts,
         micro_batch_size_override=args.micro_batch_size,
+        inner_lr=args.inner_lr,
+        inner_lr_min=args.inner_lr_min,
+        lr_warmup_rounds=args.lr_warmup_rounds,
+        lr_decay_rounds=args.lr_decay_rounds,
     )
     w.run(max_rounds=args.max_rounds)
 
