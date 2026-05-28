@@ -235,39 +235,124 @@ def cosine_lr_for_round(
     return min_lr + (peak_lr - min_lr) * cosine
 
 
+class _RoundAdvanced(Exception):
+    """Raised internally when the coord returns 409 mid-download — it moved
+    past the round we pinned. Carries the coord's new current_round so the
+    caller can re-pin and restart the whole download."""
+
+    def __init__(self, new_round: int) -> None:
+        super().__init__(f"coord advanced to round {new_round}")
+        self.new_round = new_round
+
+
+def _round_from_409(resp: httpx.Response) -> int:
+    """Extract the coord's current round from a 409. GET 409s carry a JSON
+    body {current_round, requested_round}; HEAD 409s have no body but set
+    the x-round header. Returns -1 if neither is parseable."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and "current_round" in body:
+            return int(body["current_round"])
+    except Exception:  # noqa: BLE001 — HEAD has no body, json() raises
+        pass
+    xr = resp.headers.get("x-round")
+    if xr is not None:
+        try:
+            return int(xr)
+        except ValueError:
+            pass
+    return -1
+
+
 def parallel_state_get(
+    client: httpx.Client,
+    round_no: int | None,
+    *,
+    n_chunks: int = 4,
+    max_round_restarts: int = 6,
+    log_label: str = "GET /state",
+) -> httpx.Response:
+    """Fetch /state via N parallel HTTP Range requests, pinned to round_no.
+
+    Why parallel: ISPs like Vodafone Kabel DE throttle individual TCP flows
+    (~8 Mbit/s) while allowing full aggregate bandwidth across parallel
+    streams. Splitting the 624 MB state into N chunks on N TCP connections
+    gets ~4× the single-stream throughput.
+
+    Why round-pinned: `/state?round=N` is content-addressable (each round's
+    bytes never change) → CDN-cacheable. The coord returns 409 the moment
+    it advances past N.
+
+    The slow-link trap (fixed here): on a link where the 624 MB download
+    takes longer than one round (~128 s at the current cadence), round N
+    closes mid-download and the next chunk's `?round=N` 409s. We must NOT
+    stitch chunks across two rounds — that mixes bytes from different
+    consensus states and corrupts the model. Instead: detect the 409,
+    read the coord's new current_round, abort, and restart the WHOLE
+    download pinned to the new round. Bounded by max_round_restarts so a
+    hopelessly slow link fails loudly instead of spinning forever.
+
+    round_no=None fetches the unpinned /state (legacy / no-CDN path); no
+    409 handling applies there.
+
+    Returns an httpx.Response with the full body + x-round/x-codec headers.
+    """
+    pinned = round_no
+    for restart in range(max_round_restarts):
+        try:
+            return _parallel_fetch_once(
+                client,
+                f"/state?round={pinned}" if pinned is not None else "/state",
+                n_chunks=n_chunks,
+                log_label=log_label,
+            )
+        except _RoundAdvanced as adv:
+            if adv.new_round < 0 or pinned is None:
+                # Couldn't determine the new round, or we were unpinned —
+                # nothing to re-pin to. Surface as a hard error.
+                raise httpx.HTTPError(
+                    f"{log_label}: got 409 but couldn't read coord's current round"
+                ) from adv
+            log.warning(
+                "[%s] round advanced %s -> %d mid-download; restarting "
+                "pinned download (%d/%d)",
+                log_label,
+                pinned,
+                adv.new_round,
+                restart + 1,
+                max_round_restarts,
+            )
+            pinned = adv.new_round
+    raise httpx.HTTPError(
+        f"{log_label}: state download could not finish inside a single round "
+        f"after {max_round_restarts} restarts — link too slow for the current "
+        f"round cadence (consider a longer --target-round-seconds on the coord)"
+    )
+
+
+def _parallel_fetch_once(
     client: httpx.Client,
     url: str,
     *,
-    n_chunks: int = 4,
-    log_label: str = "GET /state",
+    n_chunks: int,
+    log_label: str,
 ) -> httpx.Response:
-    """Fetch a /state-like URL via N parallel HTTP Range requests.
-
-    Why: ISPs like Vodafone Kabel DE throttle individual TCP flows
-    aggressively (~8 Mbit/s observed) while allowing the user's full
-    aggregate bandwidth (~600 Mbit/s) across many parallel streams.
-    Workers on those networks were taking >10 minutes to pull a 624 MB
-    state per round — half the wall clock was sync.
-
-    Algorithm:
-      1. HEAD the URL to learn content-length + check Range support
-      2. If server says Accept-Ranges: bytes → split into N chunks
-      3. Fetch each chunk in a thread (each on its own TCP connection)
-      4. Concatenate, synthesize a final Response object with the
-         full content + first chunk's headers (x-round, x-codec).
-      5. If server refuses Range OR HEAD fails → fall back to single
-         GET. Lets older coords and quirky middleboxes still work.
-
-    Returns an httpx.Response-shaped object. Caller uses .content,
-    .headers, .raise_for_status as usual.
+    """One attempt at a parallel range download of `url` (already pinned).
+    Raises _RoundAdvanced if the coord 409s on the HEAD or any chunk.
+    Falls back to a single GET if Range isn't supported.
     """
     # 1. Probe.
     try:
         head = client.head(url)
     except _RETRY_HTTPX_EXC as e:
         log.warning("[%s] HEAD probe failed (%s); falling back to single GET", log_label, e)
-        return client.get(url)
+        r = client.get(url)
+        if r.status_code == 409:
+            raise _RoundAdvanced(_round_from_409(r))
+        r.raise_for_status()
+        return r
+    if head.status_code == 409:
+        raise _RoundAdvanced(_round_from_409(head))
     if head.status_code != 200 or head.headers.get("accept-ranges", "").lower() != "bytes":
         log.info(
             "[%s] no Range support (status=%d, accept-ranges=%r); single GET",
@@ -275,17 +360,29 @@ def parallel_state_get(
             head.status_code,
             head.headers.get("accept-ranges"),
         )
-        return client.get(url)
+        r = client.get(url)
+        if r.status_code == 409:
+            raise _RoundAdvanced(_round_from_409(r))
+        r.raise_for_status()
+        return r
     try:
         total = int(head.headers["content-length"])
     except (KeyError, ValueError):
         log.info("[%s] no content-length on HEAD; single GET", log_label)
-        return client.get(url)
+        r = client.get(url)
+        if r.status_code == 409:
+            raise _RoundAdvanced(_round_from_409(r))
+        r.raise_for_status()
+        return r
 
     # 2. Plan chunks.
     n = max(1, n_chunks)
     if total < 4 * 1024 * 1024:  # <4 MiB: not worth parallelizing
-        return client.get(url)
+        r = client.get(url)
+        if r.status_code == 409:
+            raise _RoundAdvanced(_round_from_409(r))
+        r.raise_for_status()
+        return r
     chunk_size = (total + n - 1) // n
     ranges = []
     for i in range(n):
@@ -302,15 +399,20 @@ def parallel_state_get(
         f"{total:,}",
     )
 
-    # 3. Fetch in parallel.
+    # 3. Fetch in parallel. A 409 on any chunk → the round closed under us;
+    # signal via a shared flag and bail out to restart the whole download.
     import time as _time
     t0 = _time.time()
     chunks: list[bytes | None] = [None] * len(ranges)
     common_headers: dict[str, str] = {}
     sample_request: httpx.Request | None = None
+    advanced_round: list[int | None] = [None]
 
     def _fetch(idx: int, start: int, end: int):
         r = client.get(url, headers={"Range": f"bytes={start}-{end}"})
+        if r.status_code == 409:
+            advanced_round[0] = _round_from_409(r)
+            return idx, None, None, None
         r.raise_for_status()
         if r.status_code not in (206, 200):
             raise httpx.HTTPError(f"unexpected status {r.status_code} on Range fetch")
@@ -322,11 +424,17 @@ def parallel_state_get(
         futures = [pool.submit(_fetch, i, s, e) for i, s, e in ranges]
         for fut in as_completed(futures):
             idx, body, hdrs, req = fut.result()
+            if body is None:
+                continue  # 409 sentinel; handled after the loop
             chunks[idx] = body
             if not common_headers:
-                common_headers = hdrs  # use any chunk's headers as canonical
+                common_headers = hdrs
             if sample_request is None:
                 sample_request = req
+
+    if advanced_round[0] is not None:
+        raise _RoundAdvanced(advanced_round[0])
+
     dt = _time.time() - t0
     full_body = b"".join(c for c in chunks if c is not None)
     if len(full_body) != total:
@@ -343,11 +451,7 @@ def parallel_state_get(
         speed_mb_per_s,
     )
 
-    # 4. Synthesize a Response-like object so callers don't care about
-    # parallel vs single. httpx.Response constructor accepts content +
-    # headers; we strip Range-specific ones the caller doesn't expect.
-    # `request=` is required for the caller's r.raise_for_status() to
-    # work — httpx refuses to format errors without a request context.
+    # 4. Synthesize a Response so callers don't care about parallel vs single.
     common_headers.pop("content-range", None)
     common_headers["content-length"] = str(len(full_body))
     return httpx.Response(
@@ -626,37 +730,15 @@ class Worker:
             )
 
     def pull_state(self) -> int:
-        # Pass the round we believe the coord is at (from /register response)
-        # as a query param so Cloudflare can cache per-round state under a
-        # distinct URL — `/state?round=89` and `/state?round=90` get their
-        # own cache entries, immutable for the round's lifetime. Coord
-        # returns 409 if we're out of sync; we recover by retrying with
-        # the coord-reported current_round.
-        url = f"/state?round={self.current_round}" if self.current_round else "/state"
+        # Round-pinned parallel download. parallel_state_get internally
+        # re-pins + restarts if the coord advances past our round mid-
+        # download (slow-link case) — so no 409 handling needed here.
+        # current_round comes from the /register response.
+        pin = self.current_round if self.current_round else None
         r = retry_http(
-            lambda: parallel_state_get(self.http, url, log_label="GET /state (initial)"),
+            lambda: parallel_state_get(self.http, pin, log_label="GET /state (initial)"),
             label="GET /state (initial)",
         )
-        # 409 = round mismatch; coord tells us its current round, retry once.
-        if r.status_code == 409:
-            try:
-                their_round = int(r.json().get("current_round", -1))
-            except Exception:  # noqa: BLE001
-                their_round = -1
-            if their_round >= 0:
-                log.info(
-                    "state-pull round mismatch (we said %d, coord at %d); retrying",
-                    self.current_round,
-                    their_round,
-                )
-                self.current_round = their_round
-                retry_url = f"/state?round={their_round}"
-                r = retry_http(
-                    lambda: parallel_state_get(
-                        self.http, retry_url, log_label="GET /state (retry 409)"
-                    ),
-                    label="GET /state (retry after 409)",
-                )
         r.raise_for_status()
         round_no = int(r.headers["x-round"])
         codec = r.headers.get("x-codec", self.state_codec)
@@ -923,10 +1005,9 @@ class Worker:
                 # us its current round via `next_round`; we ask for that
                 # specific one, immutable forever once written. Parallel
                 # range fetch defeats per-flow ISP throttling.
-                resync_url = f"/state?round={next_r}"
                 r2 = retry_http(
                     lambda: parallel_state_get(
-                        self.http, resync_url, log_label="GET /state (resync)"
+                        self.http, next_r, log_label="GET /state (resync)"
                     ),
                     label="GET /state (resync)",
                 )
@@ -972,13 +1053,11 @@ class Worker:
                     break
                 time.sleep(0.5)
 
-        # By here `target` is the new round we want state for. Per-round URL
-        # so Cloudflare caches each round's state distinctly + forever.
-        # Parallel-range fetch defeats single-flow ISP throttles.
-        post_url = f"/state?round={target}"
+        # By here `target` is the new round we want state for. parallel_state_get
+        # re-pins automatically if the coord advances past it mid-download.
         r2 = retry_http(
             lambda: parallel_state_get(
-                self.http, post_url, log_label="GET /state (post-accept)"
+                self.http, target, log_label="GET /state (post-accept)"
             ),
             label="GET /state (post-accept)",
         )

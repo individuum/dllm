@@ -169,8 +169,9 @@ def test_parallel_state_get_assembles_full_body(client: TestClient) -> None:
     expected = client.get("/state").content
 
     # TestClient implements .head + .get; parallel_state_get takes any
-    # client with those methods, so we can pass it directly.
-    r = parallel_state_get(client, "/state", n_chunks=4, log_label="test")
+    # client with those methods, so we can pass it directly. Coord is at
+    # round 0, so pin to 0 (exercises the round-pinned path).
+    r = parallel_state_get(client, 0, n_chunks=4, log_label="test")
     assert r.status_code == 200
     assert r.content == expected
     # Reassembled response should carry the upstream metadata.
@@ -447,11 +448,133 @@ def test_parallel_state_get_response_supports_raise_for_status(client: TestClien
     """
     from dllm.client.worker import parallel_state_get
 
-    r = parallel_state_get(client, "/state", n_chunks=4, log_label="test")
+    r = parallel_state_get(client, 0, n_chunks=4, log_label="test")
     # Should NOT raise — status_code is 200.
     r.raise_for_status()
     # And the response must have a request attached for httpx internals.
     assert r.request is not None
+
+
+def test_parallel_state_get_repins_on_409_mid_download() -> None:
+    """THE M5 BUG. A slow link's 624 MB download outlasts a round; the coord
+    advances and 409s the in-flight chunks pinned to the old round. The
+    worker must read the coord's new current_round, abort, and restart the
+    WHOLE download at the new round — not stitch bytes across rounds.
+
+    We simulate with a fake client: round 5 always 409s (advanced to 6);
+    round 6 serves the real bytes.
+    """
+    import httpx as _httpx
+    from dllm.client.worker import parallel_state_get
+
+    REAL_BODY = b"\xab" * (8 * 1024 * 1024)  # 8 MiB → triggers chunking
+
+    class FakeClient:
+        """Minimal .head/.get stand-in. ?round=5 → 409 advance-to-6;
+        ?round=6 → normal 200/206 serving REAL_BODY."""
+
+        def __init__(self):
+            self.head_calls = 0
+            self.chunk_409s = 0
+
+        def _round_of(self, url):
+            # crude query parse
+            if "round=" in url:
+                return int(url.split("round=")[1].split("&")[0])
+            return None
+
+        def head(self, url):
+            self.head_calls += 1
+            rnd = self._round_of(url)
+            req = _httpx.Request("HEAD", "http://t" + url)
+            if rnd == 5:
+                return _httpx.Response(
+                    409, headers={"x-round": "6"}, request=req
+                )
+            return _httpx.Response(
+                200,
+                headers={
+                    "content-length": str(len(REAL_BODY)),
+                    "accept-ranges": "bytes",
+                    "x-round": "6",
+                    "x-codec": "bf16",
+                },
+                request=req,
+            )
+
+        def get(self, url, headers=None):
+            rnd = self._round_of(url)
+            req = _httpx.Request("GET", "http://t" + url)
+            if rnd == 5:
+                self.chunk_409s += 1
+                return _httpx.Response(
+                    409,
+                    json={"current_round": 6, "requested_round": 5},
+                    request=req,
+                )
+            # round 6: serve the requested byte range
+            rng = (headers or {}).get("Range", "")
+            if rng.startswith("bytes="):
+                a, b = rng[6:].split("-")
+                start, end = int(a), int(b)
+                return _httpx.Response(
+                    206,
+                    content=REAL_BODY[start : end + 1],
+                    headers={
+                        "content-range": f"bytes {start}-{end}/{len(REAL_BODY)}",
+                        "x-round": "6",
+                        "x-codec": "bf16",
+                    },
+                    request=req,
+                )
+            return _httpx.Response(
+                200, content=REAL_BODY, headers={"x-round": "6"}, request=req
+            )
+
+    fake = FakeClient()
+    # Pin to round 5; it 409s → re-pin to 6 → succeeds.
+    r = parallel_state_get(fake, 5, n_chunks=4, log_label="test")
+    assert r.status_code == 200
+    assert r.content == REAL_BODY
+    assert r.headers.get("x-round") == "6"
+    # Proof it actually restarted (didn't stitch): saw at least one 409.
+    assert fake.chunk_409s >= 1 or fake.head_calls >= 2
+
+
+def test_parallel_state_get_gives_up_after_max_restarts() -> None:
+    """A link that can NEVER finish inside a round (every attempt 409s)
+    fails loudly after max_round_restarts instead of spinning forever."""
+    import httpx as _httpx
+    from dllm.client.worker import parallel_state_get
+
+    class AlwaysAdvancingClient:
+        """Every request 409s with an ever-incrementing current_round —
+        models a link slower than the round cadence, forever."""
+
+        def __init__(self):
+            self.n = 100
+
+        def head(self, url):
+            self.n += 1
+            return _httpx.Response(
+                409,
+                headers={"x-round": str(self.n)},
+                request=_httpx.Request("HEAD", "http://t" + url),
+            )
+
+        def get(self, url, headers=None):
+            self.n += 1
+            return _httpx.Response(
+                409,
+                json={"current_round": self.n, "requested_round": self.n - 1},
+                request=_httpx.Request("GET", "http://t" + url),
+            )
+
+    with pytest.raises(_httpx.HTTPError, match="could not finish inside a single round"):
+        parallel_state_get(
+            AlwaysAdvancingClient(), 100, n_chunks=4,
+            max_round_restarts=3, log_label="test",
+        )
 
 
 def test_delta_rejects_unknown_worker(client: TestClient) -> None:
