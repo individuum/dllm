@@ -538,7 +538,7 @@ class Worker:
         inner_lr: float = 3e-4,
         inner_lr_min: float = 3e-5,
         lr_warmup_rounds: int = 20,
-        lr_decay_rounds: int = 5000,
+        lr_decay_rounds: int = 1000,
         seq_len_override: int | None = None,
     ) -> None:
         self.coord_url = coord_url.rstrip("/")
@@ -1593,12 +1593,12 @@ def main() -> None:
     ap.add_argument(
         "--lr-decay-rounds",
         type=int,
-        default=5000,
-        help="Cosine decay horizon in coord rounds. Sized so the inner LR stays "
-        "useful out to ~Chinchilla-scale tokens (~5B for 300M) instead of "
-        "flooring early — the old 1000 default plateaued the model at ~0.8B "
-        "tokens. LR hits the floor (inner-lr-min) at this round, flat thereafter. "
-        "MUST match across the cohort (LR is keyed by global round).",
+        default=1000,
+        help="Cosine decay horizon in coord rounds. LR floors at inner-lr-min at "
+        "this round, flat thereafter. NOTE: raising this MID-RUN re-warms the LR "
+        "on an already-converged model and destabilizes it (observed val 4.0 -> "
+        "4.6, delta norm 30 -> 97) — set it at run start, not as a late un-plateau "
+        "lever. Must match across the cohort (LR is keyed by global round).",
     )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
